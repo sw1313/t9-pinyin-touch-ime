@@ -117,6 +117,18 @@ bool NativeX86()
     return info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL;
 }
 
+bool NativeArm64()
+{
+    SYSTEM_INFO info{};
+    GetNativeSystemInfo(&info);
+    return info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64;
+}
+
+bool Native64()
+{
+    return NativeAmd64() || NativeArm64();
+}
+
 std::wstring KnownFolderPath(const GUID& folder)
 {
     PWSTR path = nullptr;
@@ -133,13 +145,13 @@ std::wstring KnownFolderPath(const GUID& folder)
 std::wstring DestDir()
 {
     // 安装程序是 32 位。在 64 位系统上 CSIDL_PROGRAM_FILES 会落到 (x86)，uiAccess 必须进原生 Program Files。
-    std::wstring root = NativeAmd64()
+    std::wstring root = Native64()
         ? KnownFolderPath(FOLDERID_ProgramFilesX64)
         : KnownFolderPath(FOLDERID_ProgramFiles);
     if (root.empty())
     {
         wchar_t fallback[MAX_PATH]{};
-        if (NativeAmd64())
+        if (Native64())
         {
             ExpandEnvironmentStringsW(L"%ProgramW6432%", fallback, MAX_PATH);
         }
@@ -446,9 +458,9 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmd, int)
 {
-    if (!NativeAmd64() && !NativeX86())
+    if (!NativeAmd64() && !NativeX86() && !NativeArm64())
     {
-        MessageBoxW(nullptr, L"只支持 32 位或 64 位 Windows。", L"T9 拼音触屏输入法", MB_ICONERROR);
+        MessageBoxW(nullptr, L"只支持 32 位、64 位或 ARM64 Windows。", L"T9 拼音触屏输入法", MB_ICONERROR);
         return 1;
     }
 

@@ -15,9 +15,14 @@ internal static class ImeRegister
     {
         const string clsid = "{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}";
         var plan = SetupArchPolicy.ForCurrentProcess();
+        if (plan.InstallArm64Ime)
+        {
+            TryPoint(Path.Combine(InstallDir, "arm64"), SetupArchPolicy.Native64InprocKey(clsid));
+        }
+
         if (plan.InstallX64Ime)
         {
-            TryPoint(Path.Combine(InstallDir, "x64"), SetupArchPolicy.X64InprocKey(clsid));
+            TryPoint(Path.Combine(InstallDir, "x64"), SetupArchPolicy.Native64InprocKey(clsid));
         }
 
         if (plan.InstallX86Ime)
@@ -76,7 +81,7 @@ internal static class ImeRegister
             Log.Warn($"清理 EnableByDefault 失败: {ex.Message}");
         }
 
-        var dll = NewestDll(Path.Combine(InstallDir, Environment.Is64BitProcess ? "x64" : "x86"));
+        var dll = NewestDll(Path.Combine(InstallDir, SetupArchPolicy.CurrentProcessImeArch()));
         if (string.IsNullOrEmpty(dll) || !File.Exists(dll))
         {
             return;

@@ -65,6 +65,7 @@ namespace
                 && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
                 && (_wcsicmp(fd.cFileName, L"x64") == 0
                     || _wcsicmp(fd.cFileName, L"x86") == 0
+                    || _wcsicmp(fd.cFileName, L"arm64") == 0
                     || _wcsicmp(fd.cFileName, L"hosts") == 0))
             {
                 continue;
@@ -290,7 +291,7 @@ namespace
 
     REGSAM UninstallWow()
     {
-        return NativeAmd64() ? KEY_WOW64_64KEY : 0;
+        return Native64() ? KEY_WOW64_64KEY : 0;
     }
 
     bool SetupIsWow64()
@@ -308,7 +309,7 @@ namespace
         {
             path += SetupIsWow64() ? L"\\sysnative\\regsvr32.exe" : L"\\System32\\regsvr32.exe";
         }
-        else if (NativeAmd64())
+        else if (Native64())
         {
             path += L"\\SysWOW64\\regsvr32.exe";
         }
@@ -322,7 +323,7 @@ namespace
 
     void PlacePaneHost(const std::wstring& source, const std::wstring& destExe)
     {
-        const wchar_t* rid = NativeAmd64() ? L"win-x64" : L"win-x86";
+        const wchar_t* rid = NativeArm64() ? L"win-arm64" : NativeAmd64() ? L"win-x64" : L"win-x86";
         const std::wstring host = source + L"\\hosts\\" + rid + L"\\T9Pane.exe";
         if (GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES)
         {
@@ -330,7 +331,12 @@ namespace
             return;
         }
 
-        if (!NativeAmd64())
+        if (NativeArm64())
+        {
+            ThrowMsg(L"安装包缺少 ARM64 T9Pane.exe");
+        }
+
+        if (NativeX86())
         {
             ThrowMsg(L"安装包缺少 32 位 T9Pane.exe");
         }
@@ -375,7 +381,7 @@ namespace
             RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t)));
         };
         set(L"DisplayName", L"T9 拼音触屏输入法");
-        set(L"DisplayVersion", L"0.1.0");
+        set(L"DisplayVersion", L"0.1.1");
         set(L"Publisher", L"sw1313");
         set(L"InstallLocation", DestDir().c_str());
         set(L"DisplayIcon", DestExe().c_str());
@@ -610,12 +616,13 @@ void PatchUiAccessManifest(const wchar_t* exe, const wchar_t* manifestPath)
 
 void InstallFromSource(HWND dlg, const std::wstring& source)
 {
-    if (!NativeAmd64() && !NativeX86())
+    if (!NativeAmd64() && !NativeX86() && !NativeArm64())
     {
-        ThrowMsg(L"只支持 32 位或 64 位 Windows");
+        ThrowMsg(L"只支持 32 位、64 位或 ARM64 Windows");
     }
 
-    const bool amd64 = NativeAmd64();
+    const bool native64 = Native64();
+    const wchar_t* nativeImeArch = NativeArm64() ? L"arm64" : L"x64";
     UiStatus(dlg, L"正在停止旧进程…");
     KillT9Pane();
 
@@ -637,22 +644,26 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     UiStatus(dlg, L"正在导入输入法证书…");
     ImportCertificateFile(cer);
 
-    std::wstring ime64;
+    std::wstring imeNative;
     std::wstring ime86;
-    UiStatus(dlg, amd64 ? L"正在部署 x64 / x86 输入法 DLL…" : L"正在部署 32 位输入法 DLL…");
-    if (amd64)
+    UiStatus(
+        dlg,
+        NativeArm64() ? L"正在部署 ARM64 / x86 输入法 DLL…"
+            : native64 ? L"正在部署 x64 / x86 输入法 DLL…"
+                       : L"正在部署 32 位输入法 DLL…");
+    if (native64)
     {
-        ime64 = DeployIme(NewestSignedIme(source + L"\\x64"), dest + L"\\x64");
+        imeNative = DeployIme(NewestSignedIme(source + L"\\" + nativeImeArch), dest + L"\\" + nativeImeArch);
     }
 
     ime86 = DeployIme(NewestSignedIme(source + L"\\x86"), dest + L"\\x86");
 
     GrantAppContainerReadExecute(dest.c_str(), true);
     GrantAppContainerReadExecute(exe.c_str(), false);
-    if (amd64)
+    if (native64)
     {
-        GrantAppContainerReadExecute((dest + L"\\x64").c_str(), true);
-        GrantAppContainerReadExecute(ime64.c_str(), false);
+        GrantAppContainerReadExecute((dest + L"\\" + nativeImeArch).c_str(), true);
+        GrantAppContainerReadExecute(imeNative.c_str(), false);
     }
 
     GrantAppContainerReadExecute((dest + L"\\x86").c_str(), true);
@@ -681,30 +692,30 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
 
     const std::wstring reg64 = Regsvr32Path(true);
     const std::wstring reg86 = Regsvr32Path(false);
-    const REGSAM wow64 = amd64 ? KEY_WOW64_64KEY : 0;
-    const REGSAM wow32 = amd64 ? KEY_WOW64_32KEY : 0;
+    const REGSAM wow64 = native64 ? KEY_WOW64_64KEY : 0;
+    const REGSAM wow32 = native64 ? KEY_WOW64_32KEY : 0;
 
-    UiStatus(dlg, amd64 ? L"正在注册输入法（含 32 位程序）…" : L"正在注册 32 位输入法…");
-    if (amd64)
+    UiStatus(dlg, native64 ? L"正在注册输入法（含 32 位程序）…" : L"正在注册 32 位输入法…");
+    if (native64)
     {
-        RegSvr(reg64.c_str(), ime64.c_str(), true);
-        SetInproc(HKEY_CURRENT_USER, wow64, ime64.c_str());
+        RegSvr(reg64.c_str(), imeNative.c_str(), true);
+        SetInproc(HKEY_CURRENT_USER, wow64, imeNative.c_str());
     }
 
     RegSvr(reg86.c_str(), ime86.c_str(), true);
     SetInproc(HKEY_CURRENT_USER, wow32, ime86.c_str());
 
-    if (amd64)
+    if (native64)
     {
-        if (_wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, wow64).c_str(), ime64.c_str()) != 0
-            || _wcsicmp(GetInproc(HKEY_CURRENT_USER, wow64).c_str(), ime64.c_str()) != 0
+        if (_wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, wow64).c_str(), imeNative.c_str()) != 0
+            || _wcsicmp(GetInproc(HKEY_CURRENT_USER, wow64).c_str(), imeNative.c_str()) != 0
             || _wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, wow32).c_str(), ime86.c_str()) != 0
             || _wcsicmp(GetInproc(HKEY_CURRENT_USER, wow32).c_str(), ime86.c_str()) != 0)
         {
             ThrowMsg(L"InprocServer32 校验失败");
         }
 
-        if (!VerifyAuthenticode(ime64.c_str()) || !VerifyAuthenticode(ime86.c_str()))
+        if (!VerifyAuthenticode(imeNative.c_str()) || !VerifyAuthenticode(ime86.c_str()))
         {
             ThrowMsg(L"已部署的 T9Ime DLL 签名无效");
         }
@@ -731,7 +742,7 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     WriteUninstallKey(uninstallDest);
     UiStatus(dlg, L"正在启动键盘后端…");
     StartViaExplorer(exe);
-    Log(L"安装完成 dest=%s amd64=%d", dest.c_str(), amd64 ? 1 : 0);
+    Log(L"安装完成 dest=%s amd64=%d arm64=%d", dest.c_str(), NativeAmd64() ? 1 : 0, NativeArm64() ? 1 : 0);
 }
 
 void UninstallProduct(HWND dlg)
@@ -739,10 +750,22 @@ void UninstallProduct(HWND dlg)
     UiStatus(dlg, L"正在卸载…");
     KillT9Pane();
     const std::wstring dest = DestDir();
+    const std::wstring imeArm = NewestInstalledIme(dest + L"\\arm64");
     const std::wstring ime64 = NewestInstalledIme(dest + L"\\x64");
     const std::wstring ime86 = NewestInstalledIme(dest + L"\\x86");
     const std::wstring reg64 = Regsvr32Path(true);
     const std::wstring reg86 = Regsvr32Path(false);
+    if (!imeArm.empty())
+    {
+        try
+        {
+            RegSvr(reg64.c_str(), imeArm.c_str(), false);
+        }
+        catch (...)
+        {
+        }
+    }
+
     if (!ime64.empty())
     {
         try
@@ -779,8 +802,8 @@ void UninstallProduct(HWND dlg)
 
 bool EnsureDotNetRuntime(HWND dlg)
 {
-    const bool amd64 = NativeAmd64();
-    std::wstring root = amd64
+    const bool native64 = Native64();
+    std::wstring root = native64
         ? KnownFolderPath(FOLDERID_ProgramFilesX64)
         : KnownFolderPath(FOLDERID_ProgramFiles);
     if (root.empty())
@@ -801,7 +824,7 @@ bool EnsureDotNetRuntime(HWND dlg)
         return true;
     }
 
-    const wchar_t* rid = amd64 ? L"win-x64" : L"win-x86";
+    const wchar_t* rid = NativeArm64() ? L"win-arm64" : native64 ? L"win-x64" : L"win-x86";
     wchar_t url[160]{};
     swprintf_s(url, L"https://aka.ms/dotnet/8.0/windowsdesktop-runtime-%s.exe", rid);
     UiStatus(dlg, L"未检测到 .NET 8 桌面运行时，正在下载…");

@@ -2,10 +2,10 @@
 
 ## 环境
 
-- Windows 10/11 x64
+- Windows 10/11（打包机建议 x64）
 - .NET 8 SDK
 - PowerShell 7（`pwsh`）
-- Visual Studio 或 Build Tools，并勾选 C++ x64/x86 工具链
+- Visual Studio 或 Build Tools，勾选 C++ x64/x86，以及 **MSVC ARM64**（打 Surface / ARM64 包需要）
 
 ## 日常改 C# 后怎么装
 

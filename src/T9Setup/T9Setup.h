@@ -27,6 +27,8 @@ void UiStatus(HWND dlg, const wchar_t* text);
 
 bool NativeAmd64();
 bool NativeX86();
+bool NativeArm64();
+bool Native64();
 std::wstring DestDir();
 std::wstring DestExe();
 std::wstring LogPath();

@@ -2,7 +2,7 @@
 
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("x64", "x86")]
+    [ValidateSet("x64", "x86", "arm64")]
     [string]$Arch
 )
 
@@ -16,8 +16,25 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 $dllName = "T9Ime.$([DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')).dll"
 
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
+# x64 主机交叉编译 ARM64；本机若是 ARM64 则直接 arm64。
+$vcArch = $Arch
+if ($Arch -eq "arm64") {
+    $vcArch = if ([Environment]::Is64BitOperatingSystem -and [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+        "arm64"
+    } else {
+        "x64_arm64"
+    }
+
+    $lib = Get-ChildItem -LiteralPath (Join-Path $vs "VC\Tools\MSVC") -Recurse -Filter "libcpmt.lib" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\lib\\arm64\\libcpmt\.lib$' } |
+        Select-Object -First 1
+    if (-not $lib) {
+        throw "缺少 ARM64 C++ 库（libcpmt.lib）。请在 Visual Studio Installer 勾选「MSVC v143 - VS 2022 C++ ARM64 生成工具」。"
+    }
+}
+
 $cmd = @"
-call `"$vcvars`" $Arch
+call `"$vcvars`" $vcArch
 cd /d `"$out`"
 cl /nologo /c /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE /I`"$src`" `"$src\T9Ime.cpp`" `"$src\DllMain.cpp`" `"$src\Register.cpp`"
 if errorlevel 1 exit /b 1

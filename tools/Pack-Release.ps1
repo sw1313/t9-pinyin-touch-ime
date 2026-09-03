@@ -14,10 +14,11 @@ $release = Join-Path $root "src\T9Pane\bin\Release\net8.0-windows"
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "payload"
 $x86Out = Join-Path $dist "publish-win-x86"
+$armOut = Join-Path $dist "publish-win-arm64"
 $zip = Join-Path $dist "payload.zip"
 $setup = Join-Path $dist "$name-Setup.exe"
 
-Write-Host "发布 64 位 / 32 位托管程序 $version"
+Write-Host "发布 x64 / x86 / ARM64 托管程序 $version"
 if (Test-Path -LiteralPath $stage) {
     Remove-Item -LiteralPath $stage -Recurse -Force
 }
@@ -36,8 +37,17 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish win-x86 失败"
 }
 
-Write-Host "构建 TSF DLL x64 / x86"
-foreach ($arch in "x64", "x86") {
+if (Test-Path -LiteralPath $armOut) {
+    Remove-Item -LiteralPath $armOut -Recurse -Force
+}
+
+dotnet publish $csproj -c Release -r win-arm64 --self-contained false -o $armOut --nologo
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet publish win-arm64 失败"
+}
+
+Write-Host "构建 TSF DLL x64 / x86 / ARM64"
+foreach ($arch in "x64", "x86", "arm64") {
     pwsh -NoLogo -NoProfile -File (Join-Path $root "src\T9Ime\build.ps1") -Arch $arch
     if ($LASTEXITCODE -ne 0) {
         throw "T9Ime $arch 失败"
@@ -51,14 +61,19 @@ Remove-Item -LiteralPath (Join-Path $stage "Tools\Install-UiAccess.ps1") -Force 
 
 $host64 = Join-Path $stage "hosts\win-x64"
 $host86 = Join-Path $stage "hosts\win-x86"
-New-Item -ItemType Directory -Force -Path $host64, $host86 | Out-Null
+$hostArm = Join-Path $stage "hosts\win-arm64"
+New-Item -ItemType Directory -Force -Path $host64, $host86, $hostArm | Out-Null
 Copy-Item -LiteralPath (Join-Path $stage "T9Pane.exe") -Destination (Join-Path $host64 "T9Pane.exe") -Force
 Copy-Item -LiteralPath (Join-Path $x86Out "T9Pane.exe") -Destination (Join-Path $host86 "T9Pane.exe") -Force
+Copy-Item -LiteralPath (Join-Path $armOut "T9Pane.exe") -Destination (Join-Path $hostArm "T9Pane.exe") -Force
 if (-not (Test-Path -LiteralPath (Join-Path $host86 "T9Pane.exe"))) {
     throw "缺少 32 位 T9Pane.exe"
 }
+if (-not (Test-Path -LiteralPath (Join-Path $hostArm "T9Pane.exe"))) {
+    throw "缺少 ARM64 T9Pane.exe"
+}
 
-foreach ($arch in "x64", "x86") {
+foreach ($arch in "x64", "x86", "arm64") {
     $imeDir = Join-Path $release $arch
     $signed = Get-ChildItem -LiteralPath $imeDir -File -Filter "T9Ime.*.dll" |
         Sort-Object LastWriteTimeUtc -Descending |

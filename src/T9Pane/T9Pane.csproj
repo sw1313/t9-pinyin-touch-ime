@@ -12,7 +12,7 @@
     <AssemblyName>T9Pane</AssemblyName>
     <Product>T9 拼音触屏输入法</Product>
     <Description>Windows 九键/26键触屏拼音输入法</Description>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Authors>sw1313</Authors>
     <Copyright>Copyright (C) 2026 sw1313</Copyright>
     <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
