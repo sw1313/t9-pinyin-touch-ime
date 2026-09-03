@@ -398,7 +398,7 @@ namespace
             RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t)));
         };
         set(L"DisplayName", L"T9 拼音触屏输入法");
-        set(L"DisplayVersion", L"0.1.2");
+        set(L"DisplayVersion", L"0.1.3");
         set(L"Publisher", L"sw1313");
         set(L"InstallLocation", DestDir().c_str());
         set(L"DisplayIcon", DestExe().c_str());
@@ -441,6 +441,111 @@ namespace
         while (FindNextFileW(find, &fd));
         FindClose(find);
         return best;
+    }
+
+    void TryUnreg(const wchar_t* regsvr, const std::wstring& dll)
+    {
+        if (dll.empty())
+        {
+            return;
+        }
+
+        try
+        {
+            RegSvr(regsvr, dll.c_str(), false);
+            Log(L"已注销 %s", dll.c_str());
+        }
+        catch (...)
+        {
+            Log(L"注销失败（可忽略）%s", dll.c_str());
+        }
+    }
+
+    void UnregisterInstalledImes(const std::wstring& dest)
+    {
+        const std::wstring reg64 = Regsvr32Path(true);
+        const std::wstring reg86 = Regsvr32Path(false);
+        TryUnreg(reg64.c_str(), NewestInstalledIme(dest + L"\\arm64x"));
+        TryUnreg(reg64.c_str(), NewestInstalledIme(dest + L"\\arm64"));
+        TryUnreg(reg64.c_str(), NewestInstalledIme(dest + L"\\x64"));
+        TryUnreg(reg86.c_str(), NewestInstalledIme(dest + L"\\x86"));
+    }
+
+    void DeleteKeyTree(HKEY root, const wchar_t* parent, const wchar_t* child, REGSAM wow)
+    {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(
+                root,
+                parent,
+                0,
+                DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | wow,
+                &key) != ERROR_SUCCESS)
+        {
+            return;
+        }
+
+        RegDeleteTreeW(key, child);
+        RegCloseKey(key);
+    }
+
+    void DeleteStaleImeRegistration()
+    {
+        const REGSAM views[] = {
+            Native64() ? KEY_WOW64_64KEY : static_cast<REGSAM>(0),
+            Native64() ? KEY_WOW64_32KEY : static_cast<REGSAM>(0)
+        };
+        const HKEY roots[] = { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER };
+        for (auto root : roots)
+        {
+            for (auto wow : views)
+            {
+                DeleteKeyTree(root, L"Software\\Classes\\CLSID", kClsid, wow);
+                DeleteKeyTree(root, L"Software\\Microsoft\\CTF\\TIP", kClsid, wow);
+            }
+        }
+    }
+
+    void SweepImeDirectory(const std::wstring& dir)
+    {
+        const std::wstring pattern = dir + L"\\*";
+        WIN32_FIND_DATAW fd{};
+        const HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                continue;
+            }
+
+            if (_wcsnicmp(fd.cFileName, L"T9Ime", 5) != 0)
+            {
+                continue;
+            }
+
+            const std::wstring path = dir + L"\\" + fd.cFileName;
+            if (!DeleteFileW(path.c_str()))
+            {
+                Log(L"旧 IME 文件占用中，稍后由新文件接替 %s", path.c_str());
+            }
+        }
+        while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+
+    // 覆盖安装：清掉旧 COM / TSF 注册和旧 DLL。不碰 %APPDATA%\T9Pane。
+    void ClearOldImeInstallation(const std::wstring& dest)
+    {
+        UnregisterInstalledImes(dest);
+        DeleteStaleImeRegistration();
+        SweepImeDirectory(dest + L"\\arm64x");
+        SweepImeDirectory(dest + L"\\arm64");
+        SweepImeDirectory(dest + L"\\x64");
+        SweepImeDirectory(dest + L"\\x86");
     }
 }
 
@@ -644,6 +749,8 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
 
     const std::wstring dest = DestDir();
     const std::wstring exe = DestExe();
+    UiStatus(dlg, L"正在清除旧输入法注册…");
+    ClearOldImeInstallation(dest);
     CreateDirectoryW(dest.c_str(), nullptr);
 
     UiStatus(dlg, L"正在复制程序文件…");
@@ -874,56 +981,8 @@ void UninstallProduct(HWND dlg)
     KillT9Pane();
     RestoreOfficialTouchKeyboard();
     const std::wstring dest = DestDir();
-    const std::wstring imeArm64x = NewestInstalledIme(dest + L"\\arm64x");
-    const std::wstring imeArm = NewestInstalledIme(dest + L"\\arm64");
-    const std::wstring ime64 = NewestInstalledIme(dest + L"\\x64");
-    const std::wstring ime86 = NewestInstalledIme(dest + L"\\x86");
-    const std::wstring reg64 = Regsvr32Path(true);
-    const std::wstring reg86 = Regsvr32Path(false);
-    if (!imeArm64x.empty())
-    {
-        try
-        {
-            RegSvr(reg64.c_str(), imeArm64x.c_str(), false);
-        }
-        catch (...)
-        {
-        }
-    }
-
-    if (!imeArm.empty())
-    {
-        try
-        {
-            RegSvr(reg64.c_str(), imeArm.c_str(), false);
-        }
-        catch (...)
-        {
-        }
-    }
-
-    if (!ime64.empty())
-    {
-        try
-        {
-            RegSvr(reg64.c_str(), ime64.c_str(), false);
-        }
-        catch (...)
-        {
-        }
-    }
-
-    if (!ime86.empty())
-    {
-        try
-        {
-            RegSvr(reg86.c_str(), ime86.c_str(), false);
-        }
-        catch (...)
-        {
-        }
-    }
-
+    UnregisterInstalledImes(dest);
+    DeleteStaleImeRegistration();
     AddLanguageBar(false);
     SHFILEOPSTRUCTW op{};
     wchar_t from[MAX_PATH + 2]{};
