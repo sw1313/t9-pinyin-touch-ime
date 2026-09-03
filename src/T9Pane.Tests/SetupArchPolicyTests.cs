@@ -57,27 +57,26 @@ public class SetupArchPolicyTests
     }
 
     [Fact]
-    public void Arm64_os_installs_native_ime_and_32bit_ime()
+    public void Arm64_os_registers_arm64x_forwarder_for_native_and_x64_apps()
     {
         var plan = SetupArchPolicy.For(NativeOsArch.Arm64, setupIs32Bit: true);
 
         Assert.True(SetupArchPolicy.CanInstall(NativeOsArch.Arm64));
         Assert.Equal(NativeOsArch.Arm64, SetupArchPolicy.FromProcessorArchitecture(SetupArchPolicy.ProcessorArm64));
         Assert.True(plan.InstallArm64Ime);
-        Assert.False(plan.InstallX64Ime);
+        Assert.True(plan.InstallX64Ime);
         Assert.True(plan.InstallX86Ime);
+        Assert.True(SetupArchPolicy.UsesArm64X(plan));
         Assert.Equal("win-arm64", plan.PaneHostRid);
         Assert.Equal("win-arm64", plan.DotNetRuntimeRid);
-        Assert.True(plan.UninstallKeyWow64);
-        Assert.Equal(["arm64", "x86"], SetupArchPolicy.ImeArches(plan));
-        Assert.Equal(@"sysnative\regsvr32.exe", SetupArchPolicy.Regsvr32RelativePath(plan, "arm64"));
+        Assert.Equal("arm64x", SetupArchPolicy.Native64ImeFolder(plan));
+        Assert.Equal(["arm64", "x64", "x86"], SetupArchPolicy.ImeArches(plan));
+        Assert.Equal(["arm64x", "x86"], SetupArchPolicy.RegisterImeArches(plan));
+        Assert.Equal(@"sysnative\regsvr32.exe", SetupArchPolicy.Regsvr32RelativePath(plan, "arm64x"));
         Assert.Equal(@"SysWOW64\regsvr32.exe", SetupArchPolicy.Regsvr32RelativePath(plan, "x86"));
         Assert.Equal(
             @"Software\Classes\Wow6432Node\CLSID\{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}\InprocServer32",
             SetupArchPolicy.X86InprocKey(plan, "{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}"));
-        Assert.Equal(
-            @"Software\Classes\CLSID\{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}\InprocServer32",
-            SetupArchPolicy.Native64InprocKey("{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}"));
     }
 
     [Fact]

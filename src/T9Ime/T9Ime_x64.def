@@ -1,0 +1,7 @@
+EXPORTS
+    DllGetClassObject = T9Ime_x64.DllGetClassObject
+    DllCanUnloadNow = T9Ime_x64.DllCanUnloadNow
+    DllRegisterServer = T9Ime_x64.DllRegisterServer
+    DllUnregisterServer = T9Ime_x64.DllUnregisterServer
+    T9ImeClearDefault = T9Ime_x64.T9ImeClearDefault
+    T9ImeActivate = T9Ime_x64.T9ImeActivate

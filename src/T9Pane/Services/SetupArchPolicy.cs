@@ -22,7 +22,7 @@ internal sealed record SetupArchPlan(
 
 /// <summary>
 /// 安装程序是 32 位，才能在 32 位 Windows 上启动，ARM64 Surface 上走系统自带的 x86 模拟。
-/// ARM64 系统装原生键盘进程和 ARM64 IME（给 Edge / 系统应用）；64 位 Inproc 与 x64 共用视图，v1 不另挂 x64 IME。
+/// ARM64 系统装原生键盘进程，64 位 IME 用 Arm64X 转发：ARM64 进程进原生 DLL，x64 模拟进程进 x64 DLL。
 /// </summary>
 internal static class SetupArchPolicy
 {
@@ -85,7 +85,7 @@ internal static class SetupArchPolicy
             NativeOsArch.Arm64 => new(
                 NativeOsArch.Arm64,
                 InstallArm64Ime: true,
-                InstallX64Ime: false,
+                InstallX64Ime: true,
                 InstallX86Ime: true,
                 PaneHostRid: "win-arm64",
                 DotNetRuntimeRid: "win-arm64",
@@ -118,6 +118,15 @@ internal static class SetupArchPolicy
 
         return [.. arches];
     }
+
+    public static bool UsesArm64X(SetupArchPlan plan) =>
+        plan.Os == NativeOsArch.Arm64;
+
+    public static string[] RegisterImeArches(SetupArchPlan plan) =>
+        UsesArm64X(plan) ? ["arm64x", "x86"] : ImeArches(plan);
+
+    public static string Native64ImeFolder(SetupArchPlan plan) =>
+        UsesArm64X(plan) ? "arm64x" : "x64";
 
     public static bool UsesWow6432Node(NativeOsArch os) =>
         os is NativeOsArch.X64 or NativeOsArch.Arm64;

@@ -13,7 +13,7 @@
 
 1. 打开 [Releases](https://github.com/sw1313/t9-pinyin-touch-ime/releases)，下载 `T9-Pinyin-Touch-IME-*-Setup.exe`。一份安装包支持 **x64、x86 和 ARM64** Windows（新 Surface / Snapdragon 机型走 ARM64）。
 2. 双击安装程序，在 UAC 点「是」。没有 .NET 8 时会自动下载对应架构的桌面运行时。
-3. 程序装到 `%ProgramFiles%\T9Pane`。x64 / ARM64 系统会同时注册原生 64 位和 32 位输入法 DLL；32 位系统只注册 32 位 DLL。
+3. 程序装到 `%ProgramFiles%\T9Pane`。x64 系统注册 x64 + x86 IME。ARM64 系统用 **Arm64X** 转发：原生应用走 ARM64 IME，x64 模拟应用走 x64 IME，另注册 x86 IME。32 位系统只注册 32 位 DLL。
 4. 按 **Win+空格** 切到 **T9 九键**。
 5. **用手指或鼠标点一下文本框**，键盘才会出现。只靠系统自动聚焦不会弹。
 
@@ -46,6 +46,7 @@ dotnet publish src\T9Pane\T9Pane.csproj -c Release -r win-arm64 --self-contained
 pwsh -File src\T9Ime\build.ps1 -Arch x64
 pwsh -File src\T9Ime\build.ps1 -Arch x86
 pwsh -File src\T9Ime\build.ps1 -Arch arm64
+pwsh -File src\T9Ime\build-arm64x.ps1
 ```
 
 提权安装（来源必须是 **Release** 输出）：

@@ -15,14 +15,11 @@ internal static class ImeRegister
     {
         const string clsid = "{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}";
         var plan = SetupArchPolicy.ForCurrentProcess();
-        if (plan.InstallArm64Ime)
+        if (plan.InstallX64Ime || plan.InstallArm64Ime)
         {
-            TryPoint(Path.Combine(InstallDir, "arm64"), SetupArchPolicy.Native64InprocKey(clsid));
-        }
-
-        if (plan.InstallX64Ime)
-        {
-            TryPoint(Path.Combine(InstallDir, "x64"), SetupArchPolicy.Native64InprocKey(clsid));
+            TryPoint(
+                Path.Combine(InstallDir, SetupArchPolicy.Native64ImeFolder(plan)),
+                SetupArchPolicy.Native64InprocKey(clsid));
         }
 
         if (plan.InstallX86Ime)
@@ -110,7 +107,7 @@ internal static class ImeRegister
 
         var ok = true;
         var plan = SetupArchPolicy.ForCurrentProcess();
-        foreach (var arch in SetupArchPolicy.ImeArches(plan))
+        foreach (var arch in SetupArchPolicy.RegisterImeArches(plan))
         {
             var dll = NewestDll(Path.Combine(InstallDir, arch));
 

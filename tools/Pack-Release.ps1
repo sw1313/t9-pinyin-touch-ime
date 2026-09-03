@@ -46,12 +46,17 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish win-arm64 失败"
 }
 
-Write-Host "构建 TSF DLL x64 / x86 / ARM64"
+Write-Host "构建 TSF DLL x64 / x86 / ARM64 / Arm64X"
 foreach ($arch in "x64", "x86", "arm64") {
     pwsh -NoLogo -NoProfile -File (Join-Path $root "src\T9Ime\build.ps1") -Arch $arch
     if ($LASTEXITCODE -ne 0) {
         throw "T9Ime $arch 失败"
     }
+}
+
+pwsh -NoLogo -NoProfile -File (Join-Path $root "src\T9Ime\build-arm64x.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "T9Ime arm64x 失败"
 }
 
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -73,7 +78,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $hostArm "T9Pane.exe"))) {
     throw "缺少 ARM64 T9Pane.exe"
 }
 
-foreach ($arch in "x64", "x86", "arm64") {
+foreach ($arch in "x64", "x86", "arm64", "arm64x") {
     $imeDir = Join-Path $release $arch
     $signed = Get-ChildItem -LiteralPath $imeDir -File -Filter "T9Ime.*.dll" |
         Sort-Object LastWriteTimeUtc -Descending |

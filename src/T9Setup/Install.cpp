@@ -66,6 +66,7 @@ namespace
                 && (_wcsicmp(fd.cFileName, L"x64") == 0
                     || _wcsicmp(fd.cFileName, L"x86") == 0
                     || _wcsicmp(fd.cFileName, L"arm64") == 0
+                    || _wcsicmp(fd.cFileName, L"arm64x") == 0
                     || _wcsicmp(fd.cFileName, L"hosts") == 0))
             {
                 continue;
@@ -319,6 +320,22 @@ namespace
         }
 
         return path;
+    }
+
+    std::wstring StageArm64X(
+        const std::wstring& source,
+        const std::wstring& dest,
+        const std::wstring& imeArm,
+        const std::wstring& imeX64)
+    {
+        const std::wstring dir = dest + L"\\arm64x";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        CopyOne(imeArm, dir + L"\\T9Ime_arm64.dll");
+        CopyOne(imeX64, dir + L"\\T9Ime_x64.dll");
+        const std::wstring forwarder = NewestSignedIme(source + L"\\arm64x");
+        const std::wstring destForwarder = dir + L"\\T9Ime.arm64x.dll";
+        CopyOne(forwarder, destForwarder);
+        return destForwarder;
     }
 
     void PlacePaneHost(const std::wstring& source, const std::wstring& destExe)
@@ -622,7 +639,6 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     }
 
     const bool native64 = Native64();
-    const wchar_t* nativeImeArch = NativeArm64() ? L"arm64" : L"x64";
     UiStatus(dlg, L"正在停止旧进程…");
     KillT9Pane();
 
@@ -645,24 +661,43 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     ImportCertificateFile(cer);
 
     std::wstring imeNative;
+    std::wstring imeArm;
+    std::wstring imeX64;
     std::wstring ime86;
     UiStatus(
         dlg,
-        NativeArm64() ? L"正在部署 ARM64 / x86 输入法 DLL…"
+        NativeArm64() ? L"正在部署 ARM64 / x64 / x86 输入法 DLL…"
             : native64 ? L"正在部署 x64 / x86 输入法 DLL…"
                        : L"正在部署 32 位输入法 DLL…");
-    if (native64)
+    if (NativeArm64())
     {
-        imeNative = DeployIme(NewestSignedIme(source + L"\\" + nativeImeArch), dest + L"\\" + nativeImeArch);
+        imeArm = DeployIme(NewestSignedIme(source + L"\\arm64"), dest + L"\\arm64");
+        imeX64 = DeployIme(NewestSignedIme(source + L"\\x64"), dest + L"\\x64");
+        imeNative = StageArm64X(source, dest, imeArm, imeX64);
+    }
+    else if (NativeAmd64())
+    {
+        imeNative = DeployIme(NewestSignedIme(source + L"\\x64"), dest + L"\\x64");
     }
 
     ime86 = DeployIme(NewestSignedIme(source + L"\\x86"), dest + L"\\x86");
 
     GrantAppContainerReadExecute(dest.c_str(), true);
     GrantAppContainerReadExecute(exe.c_str(), false);
-    if (native64)
+    if (NativeArm64())
     {
-        GrantAppContainerReadExecute((dest + L"\\" + nativeImeArch).c_str(), true);
+        GrantAppContainerReadExecute((dest + L"\\arm64").c_str(), true);
+        GrantAppContainerReadExecute((dest + L"\\x64").c_str(), true);
+        GrantAppContainerReadExecute((dest + L"\\arm64x").c_str(), true);
+        GrantAppContainerReadExecute(imeArm.c_str(), false);
+        GrantAppContainerReadExecute(imeX64.c_str(), false);
+        GrantAppContainerReadExecute((dest + L"\\arm64x\\T9Ime_arm64.dll").c_str(), false);
+        GrantAppContainerReadExecute((dest + L"\\arm64x\\T9Ime_x64.dll").c_str(), false);
+        GrantAppContainerReadExecute(imeNative.c_str(), false);
+    }
+    else if (NativeAmd64())
+    {
+        GrantAppContainerReadExecute((dest + L"\\x64").c_str(), true);
         GrantAppContainerReadExecute(imeNative.c_str(), false);
     }
 
@@ -699,6 +734,7 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     if (native64)
     {
         RegSvr(reg64.c_str(), imeNative.c_str(), true);
+        SetInproc(HKEY_LOCAL_MACHINE, wow64, imeNative.c_str());
         SetInproc(HKEY_CURRENT_USER, wow64, imeNative.c_str());
     }
 
@@ -750,11 +786,23 @@ void UninstallProduct(HWND dlg)
     UiStatus(dlg, L"正在卸载…");
     KillT9Pane();
     const std::wstring dest = DestDir();
+    const std::wstring imeArm64x = NewestInstalledIme(dest + L"\\arm64x");
     const std::wstring imeArm = NewestInstalledIme(dest + L"\\arm64");
     const std::wstring ime64 = NewestInstalledIme(dest + L"\\x64");
     const std::wstring ime86 = NewestInstalledIme(dest + L"\\x86");
     const std::wstring reg64 = Regsvr32Path(true);
     const std::wstring reg86 = Regsvr32Path(false);
+    if (!imeArm64x.empty())
+    {
+        try
+        {
+            RegSvr(reg64.c_str(), imeArm64x.c_str(), false);
+        }
+        catch (...)
+        {
+        }
+    }
+
     if (!imeArm.empty())
     {
         try
