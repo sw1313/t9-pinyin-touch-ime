@@ -37,7 +37,7 @@ call `"$vcvars`" x86
 cd /d `"$src`"
 rc /nologo /c 65001 /fo T9Setup.res T9Setup.rc
 if errorlevel 1 exit /b 1
-cl /nologo /O2 /EHsc /utf-8 /std:c++17 /W3 /DUNICODE /D_UNICODE /DWIN32 /D_WINDOWS T9Setup.cpp Install.cpp CertSign.cpp /Fe:`"$outExe`" /link T9Setup.res /SUBSYSTEM:WINDOWS /MANIFEST:NO ole32.lib oleaut32.lib uuid.lib advapi32.lib user32.lib shell32.lib shlwapi.lib gdi32.lib comctl32.lib crypt32.lib wintrust.lib urlmon.lib
+cl /nologo /O2 /EHsc /utf-8 /std:c++17 /W3 /DUNICODE /D_UNICODE /DWIN32 /D_WINDOWS T9Setup.cpp Install.cpp CertSign.cpp /Fe:`"$outExe`" /link T9Setup.res /SUBSYSTEM:WINDOWS /MANIFEST:NO ole32.lib oleaut32.lib uuid.lib advapi32.lib user32.lib shell32.lib shlwapi.lib gdi32.lib comctl32.lib crypt32.lib wintrust.lib urlmon.lib winhttp.lib
 if errorlevel 1 exit /b 1
 exit /b 0
 "@

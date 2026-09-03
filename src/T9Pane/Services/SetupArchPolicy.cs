@@ -150,5 +150,5 @@ internal static class SetupArchPolicy
     }
 
     public static string DotNetRuntimeUrl(string rid) =>
-        $"https://aka.ms/dotnet/8.0/windowsdesktop-runtime-{rid}.exe";
+        DotNetRuntimePolicy.ChannelUrl(rid);
 }

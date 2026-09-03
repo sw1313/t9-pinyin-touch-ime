@@ -366,6 +366,7 @@ std::wstring ResolveSource(HWND dlg)
 
 DWORD WINAPI Worker(void*)
 {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     int exitCode = 0;
     std::wstring error;
     try
@@ -378,7 +379,7 @@ DWORD WINAPI Worker(void*)
         {
             if (!EnsureDotNetRuntime(g_dlg))
             {
-                ThrowMsg(L"需要 .NET 8 桌面运行时。安装程序下载失败，请先手动安装后再运行 Setup。");
+                ThrowMsg(L"需要 .NET 8 桌面运行时。安装程序没能从微软下载，请检查网络后重试。");
             }
 
             const std::wstring source = ResolveSource(g_dlg);
@@ -400,6 +401,11 @@ DWORD WINAPI Worker(void*)
     {
         auto* text = new std::wstring(error);
         PostMessageW(g_dlg, WM_APP + 1, exitCode, reinterpret_cast<LPARAM>(text));
+    }
+
+    if (com == S_OK)
+    {
+        CoUninitialize();
     }
 
     return exitCode;

@@ -8,10 +8,12 @@
 #include <tlhelp32.h>
 #include <urlmon.h>
 #include <vector>
+#include <winhttp.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "winhttp.lib")
 
 namespace
 {
@@ -464,7 +466,7 @@ namespace
             RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t)));
         };
         set(L"DisplayName", L"T9 拼音触屏输入法");
-        set(L"DisplayVersion", L"0.1.14");
+        set(L"DisplayVersion", L"0.1.15");
         set(L"Publisher", L"sw1313");
         set(L"InstallLocation", DestDir().c_str());
         set(L"DisplayIcon", DestExe().c_str());
@@ -1178,7 +1180,7 @@ void UninstallProduct(HWND dlg)
     Log(L"卸载完成");
 }
 
-bool EnsureDotNetRuntime(HWND dlg)
+bool HasDesktopRuntime()
 {
     const bool native64 = Native64();
     std::wstring root = native64
@@ -1196,48 +1198,297 @@ bool EnsureDotNetRuntime(HWND dlg)
     const std::wstring pattern = std::wstring(dir) + L"\\8.*";
     WIN32_FIND_DATAW fd{};
     const HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
-    if (find != INVALID_HANDLE_VALUE)
+    if (find == INVALID_HANDLE_VALUE)
     {
-        FindClose(find);
+        return false;
+    }
+
+    FindClose(find);
+    return true;
+}
+
+bool FileLooksLikeRuntimeInstaller(const wchar_t* path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &data))
+    {
+        return false;
+    }
+
+    ULARGE_INTEGER size{};
+    size.LowPart = data.nFileSizeLow;
+    size.HighPart = data.nFileSizeHigh;
+    if (size.QuadPart < 20ull * 1024 * 1024)
+    {
+        Log(L"运行时安装包过小 %llu", size.QuadPart);
+        return false;
+    }
+
+    const HANDLE file = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    unsigned char magic[2]{};
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, magic, 2, &read, nullptr);
+    CloseHandle(file);
+    return ok && read == 2 && magic[0] == 'M' && magic[1] == 'Z';
+}
+
+bool DownloadRuntimeInstaller(const wchar_t* url, const wchar_t* dest)
+{
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    wchar_t host[256]{};
+    wchar_t path[2048]{};
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = ARRAYSIZE(host);
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = ARRAYSIZE(path);
+    if (!WinHttpCrackUrl(url, 0, 0, &parts))
+    {
+        Log(L"解析下载地址失败 %s err=%u", url, GetLastError());
+        return false;
+    }
+
+    const HINTERNET session = WinHttpOpen(
+        L"T9Setup",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!session)
+    {
+        Log(L"WinHttpOpen 失败 err=%u", GetLastError());
+        return false;
+    }
+
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+    protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
+    WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+    DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(session, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
+    WinHttpSetTimeouts(session, 30000, 30000, 30000, 180000);
+
+    const HINTERNET connect = WinHttpConnect(session, host, parts.nPort, 0);
+    if (!connect)
+    {
+        Log(L"连接 %s 失败 err=%u", host, GetLastError());
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+    const HINTERNET request = WinHttpOpenRequest(
+        connect,
+        L"GET",
+        path,
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        flags);
+    if (!request)
+    {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const BOOL sent = WinHttpSendRequest(
+                          request,
+                          WINHTTP_NO_ADDITIONAL_HEADERS,
+                          0,
+                          WINHTTP_NO_REQUEST_DATA,
+                          0,
+                          0,
+                          0)
+        && WinHttpReceiveResponse(request, nullptr);
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    WinHttpQueryHeaders(
+        request,
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX,
+        &status,
+        &statusSize,
+        WINHTTP_NO_HEADER_INDEX);
+    if (!sent || status != 200)
+    {
+        Log(L"下载 %s 状态 %u err=%u", url, status, GetLastError());
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    DeleteFileW(dest);
+    const HANDLE file = CreateFileW(
+        dest,
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    unsigned long long total = 0;
+    for (;;)
+    {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(request, &avail))
+        {
+            break;
+        }
+
+        if (avail == 0)
+        {
+            break;
+        }
+
+        BYTE buf[64 * 1024];
+        const DWORD chunk = avail > sizeof(buf) ? sizeof(buf) : avail;
+        DWORD got = 0;
+        if (!WinHttpReadData(request, buf, chunk, &got) || got == 0)
+        {
+            break;
+        }
+
+        DWORD written = 0;
+        if (!WriteFile(file, buf, got, &written, nullptr) || written != got)
+        {
+            CloseHandle(file);
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            DeleteFileW(dest);
+            return false;
+        }
+
+        total += written;
+    }
+
+    CloseHandle(file);
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    Log(L"下载 %s 完成 %llu 字节", url, total);
+    if (FileLooksLikeRuntimeInstaller(dest))
+    {
         return true;
     }
 
-    const wchar_t* rid = NativeArm64() ? L"win-arm64" : native64 ? L"win-x64" : L"win-x86";
-    wchar_t url[160]{};
-    swprintf_s(url, L"https://aka.ms/dotnet/8.0/windowsdesktop-runtime-%s.exe", rid);
-    UiStatus(dlg, L"未检测到 .NET 8 桌面运行时，正在下载…");
+    DeleteFileW(dest);
+    return false;
+}
+
+bool RunRuntimeInstaller(const wchar_t* path)
+{
+    wchar_t cmd[MAX_PATH + 80]{};
+    swprintf_s(cmd, L"\"%s\" /install /quiet /norestart", path);
+    STARTUPINFOW si{ sizeof(si) };
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        Log(L"启动运行时安装包失败 err=%u", GetLastError());
+        return false;
+    }
+
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, 300000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    Log(L".NET 运行时安装退出码 %u", code);
+    return code == 0 || code == 1638 || code == 3010;
+}
+
+bool EnsureDotNetRuntime(HWND dlg)
+{
+    if (HasDesktopRuntime())
+    {
+        return true;
+    }
+
+    const wchar_t* rid = NativeArm64() ? L"win-arm64" : Native64() ? L"win-x64" : L"win-x86";
     wchar_t tmp[MAX_PATH]{};
     GetTempPathW(MAX_PATH, tmp);
     wchar_t name[64]{};
     swprintf_s(name, L"windowsdesktop-runtime-8.0-%s.exe", rid);
     PathAppendW(tmp, name);
-    HRESULT hr = URLDownloadToFileW(
-        nullptr,
-        url,
-        tmp,
-        0,
-        nullptr);
-    if (FAILED(hr))
+
+    wchar_t urls[3][240]{};
+    swprintf_s(urls[0], L"https://aka.ms/dotnet/8.0/windowsdesktop-runtime-%s.exe", rid);
+    swprintf_s(
+        urls[1],
+        L"https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/8.0.30/windowsdesktop-runtime-8.0.30-%s.exe",
+        rid);
+    swprintf_s(
+        urls[2],
+        L"https://dotnetcli.azureedge.net/dotnet/WindowsDesktop/8.0.30/windowsdesktop-runtime-8.0.30-%s.exe",
+        rid);
+
+    UiStatus(dlg, L"未检测到 .NET 8 桌面运行时，正在下载…");
+    bool got = false;
+    for (const auto& url : urls)
     {
-        Log(L"下载运行时失败 hr=0x%08X", static_cast<unsigned>(hr));
+        Log(L"尝试下载运行时 %s", url);
+        if (DownloadRuntimeInstaller(url, tmp))
+        {
+            got = true;
+            break;
+        }
+    }
+
+    if (!got)
+    {
+        UiStatus(dlg, L"正在用备用方式下载 .NET 8 桌面运行时…");
+        const HRESULT hr = URLDownloadToFileW(nullptr, urls[0], tmp, 0, nullptr);
+        if (SUCCEEDED(hr) && FileLooksLikeRuntimeInstaller(tmp))
+        {
+            got = true;
+        }
+        else
+        {
+            Log(L"URLMON 下载失败 hr=0x%08X", static_cast<unsigned>(hr));
+        }
+    }
+
+    if (!got)
+    {
         return false;
     }
 
     UiStatus(dlg, L"正在安装 .NET 8 桌面运行时…");
-    SHELLEXECUTEINFOW sei{ sizeof(sei) };
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpFile = tmp;
-    sei.lpParameters = L"/install /quiet /norestart";
-    sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei))
+    const bool installed = RunRuntimeInstaller(tmp);
+    DeleteFileW(tmp);
+    if (!installed)
     {
         return false;
     }
 
-    WaitForSingleObject(sei.hProcess, 300000);
-    DWORD code = 1;
-    GetExitCodeProcess(sei.hProcess, &code);
-    CloseHandle(sei.hProcess);
-    Log(L".NET 运行时安装退出码 %u", code);
-    return code == 0 || code == 3010;
+    if (HasDesktopRuntime())
+    {
+        return true;
+    }
+
+    Log(L"运行时安装包已成功退出，但尚未看到 Microsoft.WindowsDesktop.App\\8.*");
+    return true;
 }

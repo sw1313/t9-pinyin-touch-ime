@@ -102,4 +102,21 @@ public class SetupArchPolicyTests
             "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-arm64.exe",
             SetupArchPolicy.DotNetRuntimeUrl("win-arm64"));
     }
+
+    [Fact]
+    public void Desktop_runtime_falls_back_to_official_cdn_when_aka_redirect_fails()
+    {
+        var urls = DotNetRuntimePolicy.DownloadUrls("win-x64");
+        Assert.Equal(DotNetRuntimePolicy.ChannelUrl("win-x64"), urls[0]);
+        Assert.Contains("builds.dotnet.microsoft.com", urls[1]);
+        Assert.Contains("8.0.30", urls[1]);
+        Assert.Contains("dotnetcli.azureedge.net", urls[2]);
+        Assert.True(DotNetRuntimePolicy.IsValidInstaller("MZ"u8, 40L * 1024 * 1024));
+        Assert.False(DotNetRuntimePolicy.IsValidInstaller("<!"u8, 40L * 1024 * 1024));
+        Assert.False(DotNetRuntimePolicy.IsValidInstaller("MZ"u8, 1024));
+        Assert.True(DotNetRuntimePolicy.AcceptInstallerExit(0));
+        Assert.True(DotNetRuntimePolicy.AcceptInstallerExit(1638));
+        Assert.True(DotNetRuntimePolicy.AcceptInstallerExit(3010));
+        Assert.False(DotNetRuntimePolicy.AcceptInstallerExit(1603));
+    }
 }
