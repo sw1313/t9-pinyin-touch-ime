@@ -104,7 +104,6 @@ pwsh -File src\T9Pane\Tools\Test-UwpIme.ps1 -Scenario All
 | `src/T9Pane.Tests` | 单元测试 |
 | `src/T9Pane/Data/xiaobai-t9` | 随包开源词库（约 43 MB） |
 | `tools/Pack-Release.ps1` | 打出 Win32 `Setup.exe` |
-| `AGENTS.md` | 给协作者和 AI 的安装/判定约束 |
 
 `bin/`、`obj/`、`dist/` 不进 git。二进制安装包只放在 GitHub Release。
 
