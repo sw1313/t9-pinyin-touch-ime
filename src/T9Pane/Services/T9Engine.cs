@@ -149,45 +149,23 @@ internal sealed class T9Engine
             return "";
         }
 
-        var hit = Query(digits, 1).FirstOrDefault();
-        if (hit is not null && !string.IsNullOrWhiteSpace(hit.Pinyin))
+        string? pinyin = null;
+        foreach (var hit in Query(digits, 8))
         {
-            var syllables = new List<string>();
-            foreach (var raw in hit.Pinyin.Split([' ', '\'', '’', '-'], StringSplitOptions.RemoveEmptyEntries))
+            if (string.IsNullOrWhiteSpace(hit.Pinyin))
             {
-                var letters = new StringBuilder(raw.Length);
-                foreach (var ch in raw)
-                {
-                    var folded = FoldPinyin(ch);
-                    if (folded is >= 'a' and <= 'z' or 'v')
-                    {
-                        letters.Append(folded);
-                    }
-                }
-
-                if (letters.Length > 0)
-                {
-                    syllables.Add(letters.ToString());
-                }
+                continue;
             }
 
-            if (syllables.Count > 0)
+            pinyin ??= hit.Pinyin;
+            if (CompactLetters(hit.Pinyin).Length >= digits.Length)
             {
-                return string.Join("'", syllables);
+                pinyin = hit.Pinyin;
+                break;
             }
         }
 
-        var sb = new StringBuilder(digits.Length);
-        foreach (var digit in digits)
-        {
-            var letters = LettersForKey(digit);
-            if (letters.Length > 0)
-            {
-                sb.Append(letters[0]);
-            }
-        }
-
-        return sb.ToString();
+        return PinyinPreviewPolicy.FromTypedDigits(digits, pinyin);
     }
 
     public static string LettersForKey(char digit) => digit switch

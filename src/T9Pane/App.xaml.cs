@@ -110,9 +110,7 @@ public partial class App
         _tray = new TrayHost(
             _settings,
             () => Sync(),
-            () => Sync(),
             ReloadLexicon,
-            RegisterIme,
             ExitApp,
             () => AppearanceDialog.ShowOpacity(_overlay, _settings),
             () => AppearanceDialog.ShowSkin(_overlay, _settings));
@@ -136,18 +134,6 @@ public partial class App
         _engine.Load(_catalog, _settings.ExtraLexiconDirectories);
         _overlay?.RefreshChrome();
         Log.Info($"已重新加载词库：{_engine.SourceDescription}");
-    }
-
-    private void RegisterIme()
-    {
-        if (ImeRegister.Run(true))
-        {
-            _tray?.Tip("已加入输入法选择器。按 Win+空格 切到「T9 九键」。");
-        }
-        else
-        {
-            _tray?.Tip("注册失败。请用管理员运行 T9Pane.exe /register");
-        }
     }
 
     private void ExitApp()

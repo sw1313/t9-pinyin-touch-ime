@@ -53,6 +53,8 @@ internal sealed class AppSettings
                 loaded.OverlayOpacity = KeyboardSkinPolicy.ClampOverlay(
                     loaded.OverlayOpacity <= 0 ? 1 : loaded.OverlayOpacity);
                 loaded.KeyboardSkins ??= [];
+                loaded.Enabled = true;
+                loaded.PreviewMode = false;
                 return loaded;
             }
         }

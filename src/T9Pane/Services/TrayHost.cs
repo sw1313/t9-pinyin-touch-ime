@@ -18,9 +18,7 @@ internal sealed class TrayHost : IDisposable
     private readonly NotifyIcon _icon;
     private readonly AppSettings _settings;
     private readonly Action _onChanged;
-    private readonly Action _onPreview;
     private readonly Action _onReload;
-    private readonly Action _onInstall;
     private readonly Action _onExit;
     private readonly Action _onOpacity;
     private readonly Action _onSkin;
@@ -29,18 +27,14 @@ internal sealed class TrayHost : IDisposable
     public TrayHost(
         AppSettings settings,
         Action onChanged,
-        Action onPreview,
         Action onReload,
-        Action onInstall,
         Action onExit,
         Action onOpacity,
         Action onSkin)
     {
         _settings = settings;
         _onChanged = onChanged;
-        _onPreview = onPreview;
         _onReload = onReload;
-        _onInstall = onInstall;
         _onExit = onExit;
         _onOpacity = onOpacity;
         _onSkin = onSkin;
@@ -65,29 +59,12 @@ internal sealed class TrayHost : IDisposable
 
             dispatcher.BeginInvoke(ShowMenu);
         };
-        _icon.DoubleClick += (_, _) =>
-        {
-            _settings.Enabled = !_settings.Enabled;
-            _settings.Save();
-            _onChanged();
-        };
     }
 
     private void ShowMenu()
     {
         CloseMenu();
         var items = new StackPanel();
-        AddCheck(items, "启用九键面板", _settings.Enabled, () =>
-        {
-            _settings.Enabled = !_settings.Enabled;
-            SaveAndNotify();
-        });
-        AddCheck(items, "预览模式（不依赖触摸键盘）", _settings.PreviewMode, () =>
-        {
-            _settings.PreviewMode = !_settings.PreviewMode;
-            SaveAndNotify();
-            _onPreview();
-        });
         AddCheck(items, "开机启动", _settings.AutoStart, () =>
         {
             _settings.AutoStart = !_settings.AutoStart;
@@ -100,7 +77,6 @@ internal sealed class TrayHost : IDisposable
         AddItem(items, "重新加载词库", _onReload);
         AddItem(items, "打开用户词库", OpenUserLexicon);
         AddItem(items, "打开日志", () => OpenFile(AppSettings.LogPath));
-        AddItem(items, "安装到输入法选择器（Win+空格可切换）", _onInstall);
         items.Children.Add(Rule());
         AddItem(items, "退出", _onExit);
 
@@ -242,13 +218,6 @@ internal sealed class TrayHost : IDisposable
         Margin = new Thickness(8, 4, 8, 4),
         Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(232, 236, 241))
     };
-
-    public void Tip(string text)
-    {
-        _icon.BalloonTipTitle = "T9Pane";
-        _icon.BalloonTipText = text;
-        _icon.ShowBalloonTip(8000);
-    }
 
     private void SaveAndNotify()
     {

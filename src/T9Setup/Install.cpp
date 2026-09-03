@@ -398,7 +398,7 @@ namespace
             RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t)));
         };
         set(L"DisplayName", L"T9 拼音触屏输入法");
-        set(L"DisplayVersion", L"0.1.3");
+        set(L"DisplayVersion", L"0.1.4");
         set(L"Publisher", L"sw1313");
         set(L"InstallLocation", DestDir().c_str());
         set(L"DisplayIcon", DestExe().c_str());

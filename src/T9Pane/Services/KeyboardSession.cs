@@ -491,7 +491,7 @@ internal sealed class KeyboardSession
     {
         using var scope = Perf.Begin("session.sync");
         _officialTouch.Sync(OfficialTouchKeyboardPolicy.ShouldSuppress(
-            _settings.Enabled,
+            true,
             T9ProfileProbe.IsSelected()
                 || ImeHost.Shared.CanCommitForeground()
                 || ImeHost.Shared.HasForegroundProfileLease()
@@ -638,14 +638,6 @@ internal sealed class KeyboardSession
                 ? ImeHost.Shared.HasSystemProfileLease()
                 : ImeHost.Shared.HasForegroundProfileLease());
         var visibleT9Lease = t9ContextActive || hasProfileLease || desktopContextGrace;
-        if (!_settings.Enabled)
-        {
-            ResetPendingFirstShow();
-            _overlay.SetPinned(false);
-            _overlay.HideOverlay();
-            return;
-        }
-
         if (!visibleT9Lease)
         {
             if (searchSession)
@@ -660,12 +652,6 @@ internal sealed class KeyboardSession
         }
 
         _overlay.PixelSize(out var boardW, out var boardH);
-        if (_settings.PreviewMode)
-        {
-            _overlay.PlaceOn(KeyboardPlacer.Preview(boardW, boardH), IntPtr.Zero);
-            return;
-        }
-
         var field = default(InputField);
         var hasNativeField = ImeHost.Shared.TryGetNativeInputField(out var nativeField);
         if (!systemTextHost)
@@ -787,7 +773,7 @@ internal sealed class KeyboardSession
         _invocationSurface = field.TopLevel;
 
         if (!KeyboardVisibilityPolicy.ShouldShow(
-                _settings.Enabled,
+                true,
                 _userDismissed,
                 visibleT9Lease,
                 _invocationAuthorized))
