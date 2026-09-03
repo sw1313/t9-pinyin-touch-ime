@@ -323,6 +323,7 @@ internal sealed class KeyboardSession
     private readonly AppSettings _settings;
     private readonly T9OverlayWindow _overlay;
     private readonly ForegroundTracker _foreground;
+    private readonly OfficialTouchKeyboardGuard _officialTouch = new();
     /// <summary>一次点击最多等多久。任务栏搜索交接给 SearchHost 实测约 700ms。</summary>
     private static readonly TimeSpan PointerIntentWindow = TimeSpan.FromSeconds(2);
 
@@ -484,9 +485,17 @@ internal sealed class KeyboardSession
 
     public void Sync(bool imeDocument = false) => SyncCore();
 
+    public void Shutdown() => _officialTouch.Dispose();
+
     private void SyncCore()
     {
         using var scope = Perf.Begin("session.sync");
+        _officialTouch.Sync(OfficialTouchKeyboardPolicy.ShouldSuppress(
+            _settings.Enabled,
+            T9ProfileProbe.IsSelected()
+                || ImeHost.Shared.CanCommitForeground()
+                || ImeHost.Shared.HasForegroundProfileLease()
+                || ImeHost.Shared.HasSystemProfileLease()));
         var fg = NativeMethods.GetForegroundWindow();
         var top = NativeMethods.GetAncestor(fg, NativeMethods.GaRoot);
         var hasTaskbarSearch = InputFieldProbe.TryGetFocusedTaskbarSearch(

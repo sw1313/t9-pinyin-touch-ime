@@ -398,7 +398,7 @@ namespace
             RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t)));
         };
         set(L"DisplayName", L"T9 拼音触屏输入法");
-        set(L"DisplayVersion", L"0.1.1");
+        set(L"DisplayVersion", L"0.1.2");
         set(L"Publisher", L"sw1313");
         set(L"InstallLocation", DestDir().c_str());
         set(L"DisplayIcon", DestExe().c_str());
@@ -781,10 +781,98 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     Log(L"安装完成 dest=%s amd64=%d arm64=%d", dest.c_str(), NativeAmd64() ? 1 : 0, NativeArm64() ? 1 : 0);
 }
 
+    void RestoreOfficialTouchKeyboard()
+    {
+        HKEY key = nullptr;
+        const REGSAM access = KEY_READ | KEY_WRITE | KEY_WOW64_64KEY;
+        if (RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\TabletTip\\1.7",
+                0,
+                access,
+                &key) != ERROR_SUCCESS)
+        {
+            return;
+        }
+
+        DWORD type = 0;
+        DWORD held = 0;
+        DWORD size = sizeof(held);
+        if (RegQueryValueExW(key, L"T9Pane.Backup.Active", nullptr, &type, reinterpret_cast<BYTE*>(&held), &size)
+                != ERROR_SUCCESS
+            || held == 0)
+        {
+            RegCloseKey(key);
+            return;
+        }
+
+        auto restoreDword = [&](const wchar_t* name, const wchar_t* hadName, const wchar_t* backupName)
+        {
+            DWORD had = 0;
+            DWORD hadSize = sizeof(had);
+            if (RegQueryValueExW(key, hadName, nullptr, &type, reinterpret_cast<BYTE*>(&had), &hadSize) != ERROR_SUCCESS)
+            {
+                return;
+            }
+
+            if (had)
+            {
+                DWORD value = 0;
+                DWORD valueSize = sizeof(value);
+                if (RegQueryValueExW(
+                        key,
+                        backupName,
+                        nullptr,
+                        &type,
+                        reinterpret_cast<BYTE*>(&value),
+                        &valueSize) == ERROR_SUCCESS)
+                {
+                    RegSetValueExW(
+                        key,
+                        name,
+                        0,
+                        REG_DWORD,
+                        reinterpret_cast<const BYTE*>(&value),
+                        sizeof(value));
+                }
+
+                return;
+            }
+
+            RegDeleteValueW(key, name);
+        };
+
+        restoreDword(
+            L"TouchKeyboardTapInvoke",
+            L"T9Pane.Backup.HadTouchKeyboardTapInvoke",
+            L"T9Pane.Backup.TouchKeyboardTapInvoke");
+        restoreDword(
+            L"EnableDesktopModeAutoInvoke",
+            L"T9Pane.Backup.HadEnableDesktopModeAutoInvoke",
+            L"T9Pane.Backup.EnableDesktopModeAutoInvoke");
+        RegDeleteValueW(key, L"T9Pane.Backup.Active");
+        RegDeleteValueW(key, L"T9Pane.Backup.HadEnableDesktopModeAutoInvoke");
+        RegDeleteValueW(key, L"T9Pane.Backup.EnableDesktopModeAutoInvoke");
+        RegDeleteValueW(key, L"T9Pane.Backup.HadTouchKeyboardTapInvoke");
+        RegDeleteValueW(key, L"T9Pane.Backup.TouchKeyboardTapInvoke");
+        RegCloseKey(key);
+        DWORD_PTR result = 0;
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            800,
+            &result);
+        Log(L"已恢复系统触摸键盘「显示触摸键盘」原设置");
+    }
+
 void UninstallProduct(HWND dlg)
 {
     UiStatus(dlg, L"正在卸载…");
     KillT9Pane();
+    RestoreOfficialTouchKeyboard();
     const std::wstring dest = DestDir();
     const std::wstring imeArm64x = NewestInstalledIme(dest + L"\\arm64x");
     const std::wstring imeArm = NewestInstalledIme(dest + L"\\arm64");

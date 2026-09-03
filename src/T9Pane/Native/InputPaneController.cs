@@ -33,17 +33,26 @@ internal static class InputPaneController
 
     public static void TryHide()
     {
-        if (!InputPaneInterop.TryGetLocation(out _))
-        {
-            return;
-        }
-
         SipInvoker.Reset();
         SipSuppressor.HideOfficial();
     }
 
-    private static bool TryShowWinRt(IntPtr hwnd)
+    public static bool TryHideWinRt(IntPtr hwnd) => TryWinRt(hwnd, hide: true);
+
+    private static bool TryShowWinRt(IntPtr hwnd) => TryWinRt(hwnd, hide: false);
+
+    private static bool TryWinRt(IntPtr hwnd, bool hide)
     {
+        if (hwnd == IntPtr.Zero)
+        {
+            hwnd = NativeMethods.GetForegroundWindow();
+        }
+
+        if (hwnd == IntPtr.Zero)
+        {
+            return false;
+        }
+
         var hstr = IntPtr.Zero;
         var factoryPtr = IntPtr.Zero;
         var panePtr = IntPtr.Zero;
@@ -69,8 +78,8 @@ internal static class InputPaneController
             }
 
             var pane = (IInputPane2)Marshal.GetObjectForIUnknown(panePtr);
-            var hr = pane.TryShow(out var shown);
-            return hr == 0 && shown != 0;
+            var hr = hide ? pane.TryHide(out var done) : pane.TryShow(out done);
+            return hr == 0 && done != 0;
         }
         catch
         {

@@ -159,6 +159,7 @@ public partial class App
     {
         _pointerIntent?.Dispose();
         _chromiumA11y?.Dispose();
+        _session?.Shutdown();
         ImeHost.Shared.Dispose();
         _overlay?.HideOverlay();
         _fitter.Restore();

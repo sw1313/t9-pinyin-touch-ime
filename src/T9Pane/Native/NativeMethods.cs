@@ -263,6 +263,8 @@ internal static class NativeMethods
     /// </summary>
     public const int ChromiumHoneypotObjectId = 1;
     public const uint SmtoAbortIfHung = 0x0002;
+    public static readonly IntPtr HwndBroadcast = new(0xFFFF);
+    public const uint WmSettingChange = 0x001A;
     public const int ObjidWindow = 0;
     public const int ObjidClient = unchecked((int)0xFFFFFFFC);
     public const int ObjidCaret = unchecked((int)0xFFFFFFF8);
