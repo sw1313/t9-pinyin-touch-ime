@@ -51,6 +51,11 @@ internal sealed class ImeHost : IDisposable
     private readonly object _gate = new();
     private readonly List<ImeClient> _clients = [];
     private readonly ImeCommandChannels _cmdPipes = new();
+    private CtfLayoutWatcher? _layoutWatcher;
+    private ImeLayoutWatcher? _imeWatcher;
+    private bool _layoutIsT9;
+    private bool _layoutLogged;
+    private CancellationTokenSource? _layoutDebounce;
     private ulong _visibleHostHwnd;
     private long _observationSequence;
     private CancellationTokenSource? _cts;
@@ -117,6 +122,9 @@ internal sealed class ImeHost : IDisposable
         Task.Run(() => Listen(token, PipeAcl.AppContainerNotificationPipe), token);
         Task.Run(() => ListenCmd(token, PipeAcl.CommandPipe), token);
         Task.Run(() => ListenCmd(token, PipeAcl.AppContainerCommandPipe), token);
+        _layoutWatcher = new CtfLayoutWatcher(() => RefreshUserLayout("语言栏"));
+        _imeWatcher = new ImeLayoutWatcher(() => RefreshUserLayout("输入法"));
+        RefreshUserLayout("启动");
     }
 
     private void ProcessNotifications(CancellationToken token)
@@ -187,6 +195,66 @@ internal sealed class ImeHost : IDisposable
         {
             Log.Info($"已恢复 {discovered} 个运行中 T9 客户端");
         }
+    }
+
+    public bool HasOfficialT9Profile()
+    {
+        lock (_gate)
+        {
+            return _layoutIsT9;
+        }
+    }
+
+    public void NoteThreadProfile(bool _) => RefreshUserLayout("TSF");
+
+    public void RefreshUserLayout(string reason)
+    {
+        if (reason == "启动")
+        {
+            ApplyUserLayout(reason);
+            return;
+        }
+
+        CancellationToken token;
+        lock (_gate)
+        {
+            _layoutDebounce?.Cancel();
+            _layoutDebounce?.Dispose();
+            _layoutDebounce = new CancellationTokenSource();
+            token = _layoutDebounce.Token;
+        }
+
+        _ = DebounceUserLayout(reason, token);
+    }
+
+    private async Task DebounceUserLayout(string reason, CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(200, token).ConfigureAwait(false);
+            ApplyUserLayout(reason);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private void ApplyUserLayout(string reason)
+    {
+        var t9 = TsfLayoutSelection.IsT9Selected();
+        lock (_gate)
+        {
+            if (t9 == _layoutIsT9 && _layoutLogged)
+            {
+                return;
+            }
+
+            _layoutIsT9 = t9;
+            _layoutLogged = true;
+        }
+
+        Log.Info($"语言栏布局 {(t9 ? "T9 九键" : "其他输入法")}（{reason}）");
+        RaiseChanged();
     }
 
     public bool CanCommitForeground()
@@ -368,6 +436,13 @@ internal sealed class ImeHost : IDisposable
 
     public void Dispose()
     {
+        _layoutWatcher?.Dispose();
+        _layoutWatcher = null;
+        _imeWatcher?.Dispose();
+        _imeWatcher = null;
+        _layoutDebounce?.Cancel();
+        _layoutDebounce?.Dispose();
+        _layoutDebounce = null;
         _cts?.Cancel();
         _cts = null;
         try
@@ -736,11 +811,13 @@ internal sealed class ImeHost : IDisposable
 
             if (!accepted)
             {
+                RaiseChanged();
                 return;
             }
             HasDocumentFocus = effectiveDocumentFocused;
             Log.Info(
                 $"T9 九键已激活 pid={pid} hwnd={hwnd} doc={documentFocused} thread={threadFocused} seq={sequence}");
+            RefreshUserLayout("激活");
             RaiseChanged();
             return;
         }
@@ -776,6 +853,7 @@ internal sealed class ImeHost : IDisposable
 
             HasDocumentFocus = HasClient;
             Log.Info($"T9 九键已在进程 {pid} 停用");
+            RefreshUserLayout("停用");
             RaiseChanged();
             return;
         }
@@ -791,7 +869,6 @@ internal sealed class ImeHost : IDisposable
                 NativeMethods.GetWindowThreadProcessId(new IntPtr((long)hwnd), out pid);
             }
 
-            var stateApplied = false;
             var deactivatedVisibleHost = false;
             lock (_gate)
             {
@@ -799,35 +876,29 @@ internal sealed class ImeHost : IDisposable
                     hwnd != 0 && unchecked((ulong)client.Hwnd.ToInt64()) == hwnd);
                 if (selected is not null)
                 {
-                    stateApplied = ImeClientState.ApplyProfile(selected, active, sequence);
+                    ImeClientState.ApplyProfile(selected, active, sequence);
                 }
                 else
                 {
                     // profile 通知的 hwnd 是 IME 消息窗，对不上文档窗时按进程落地。
-                    stateApplied = ImeClientState.ApplyProfileToProcess(
+                    ImeClientState.ApplyProfileToProcess(
                         _clients,
                         pid,
                         active,
-                        sequence)
-                        || !active;
+                        sequence);
                 }
 
-                deactivatedVisibleHost = stateApplied
-                    && !active
+                deactivatedVisibleHost = !active
                     && _clients.Any(client =>
                         unchecked((ulong)client.Hwnd.ToInt64()) == _visibleHostHwnd
                         && !client.ProfileActive);
-            }
-
-            if (!stateApplied)
-            {
-                return;
             }
             if (deactivatedVisibleHost)
             {
                 HideHost();
             }
             Log.Info($"TSF 当前配置 {(active ? "T9" : "其他输入法")} pid={pid} hwnd={hwnd}");
+            RefreshUserLayout("配置");
             RaiseChanged();
             return;
         }

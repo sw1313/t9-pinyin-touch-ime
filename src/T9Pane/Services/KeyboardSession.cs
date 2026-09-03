@@ -487,15 +487,13 @@ internal sealed class KeyboardSession
 
     public void Shutdown() => _officialTouch.Dispose();
 
+    private static bool T9Live() =>
+        OfficialTouchKeyboardPolicy.IsT9Live(ImeHost.Shared.HasOfficialT9Profile());
+
     private void SyncCore()
     {
         using var scope = Perf.Begin("session.sync");
-        _officialTouch.Sync(OfficialTouchKeyboardPolicy.ShouldSuppress(
-            true,
-            T9ProfileProbe.IsSelected()
-                || ImeHost.Shared.CanCommitForeground()
-                || ImeHost.Shared.HasForegroundProfileLease()
-                || ImeHost.Shared.HasSystemProfileLease()));
+        _officialTouch.Sync(OfficialTouchKeyboardPolicy.ShouldSuppress(true, T9Live()));
         var fg = NativeMethods.GetForegroundWindow();
         var top = NativeMethods.GetAncestor(fg, NativeMethods.GaRoot);
         var hasTaskbarSearch = InputFieldProbe.TryGetFocusedTaskbarSearch(

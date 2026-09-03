@@ -31,11 +31,35 @@ namespace
         return path;
     }
 
+    void RotateLogIfHuge(const wchar_t* file)
+    {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (!GetFileAttributesExW(file, GetFileExInfoStandard, &data))
+        {
+            return;
+        }
+
+        ULARGE_INTEGER size{};
+        size.LowPart = data.nFileSizeLow;
+        size.HighPart = data.nFileSizeHigh;
+        if (size.QuadPart < 2ull * 1024 * 1024)
+        {
+            return;
+        }
+
+        wchar_t bak[MAX_PATH]{};
+        wcsncpy_s(bak, file, MAX_PATH);
+        wcscat_s(bak, L".old");
+        DeleteFileW(bak);
+        MoveFileW(file, bak);
+    }
+
     void OpenLog()
     {
         CreateDirectoryW(LogPath().c_str(), nullptr);
         wchar_t file[MAX_PATH]{};
         PathCombineW(file, LogPath().c_str(), L"install-uiaccess.log");
+        RotateLogIfHuge(file);
         g_log = CreateFileW(
             file,
             FILE_APPEND_DATA,

@@ -19,6 +19,7 @@ public partial class App
     private T9OverlayWindow? _overlay;
     private KeyboardSession? _session;
     private TrayHost? _tray;
+    private TsfProfileActivationSink? _profileSink;
     private readonly WindowFitter _fitter = new();
 
     protected override void OnStartup(StartupEventArgs e)
@@ -90,16 +91,19 @@ public partial class App
                 _session?.NotePointerInput(x, y, origin);
             }
         };
-        ImeHost.Shared.Start();
-        // 这里必须逐条通知立即同步：开始菜单搜索框由 StartMenuExperienceHost 转交给
-        // SearchHost，授权发生在交接完成之前，靠随后每一条 TSF 通知补一次同步才能把
-        // 键盘放上去。合并或降低优先级会让第一次点击弹不出来。
+        // 先挂 Changed，再 Start：启动时读到的语言栏才能立刻 Sync 握「显示触摸键盘」。
         ImeHost.Shared.Changed += () => Dispatcher.BeginInvoke(() =>
         {
             UpdatePointerTracking();
             _session.NoteImeChanged();
             _session.Sync(ImeHost.Shared.HasDocumentFocus);
         });
+        ImeHost.Shared.Start();
+        _profileSink = new TsfProfileActivationSink(ImeHost.Shared.NoteThreadProfile);
+        _profileSink.Start();
+        // 这里必须逐条通知立即同步：开始菜单搜索框由 StartMenuExperienceHost 转交给
+        // SearchHost，授权发生在交接完成之前，靠随后每一条 TSF 通知补一次同步才能把
+        // 键盘放上去。合并或降低优先级会让第一次点击弹不出来。
         _foreground.Changed += () => Dispatcher.BeginInvoke(() =>
         {
             UpdatePointerTracking();
@@ -146,6 +150,7 @@ public partial class App
         _pointerIntent?.Dispose();
         _chromiumA11y?.Dispose();
         _session?.Shutdown();
+        _profileSink?.Dispose();
         ImeHost.Shared.Dispose();
         _overlay?.HideOverlay();
         _fitter.Restore();

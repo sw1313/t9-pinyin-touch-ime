@@ -103,6 +103,20 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetKeyboardLayout(uint idThread);
+
+    public const uint RegNotifyChangeName = 0x00000001;
+    public const uint RegNotifyChangeLastSet = 0x00000004;
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern int RegNotifyChangeKeyValue(
+        Microsoft.Win32.SafeHandles.SafeRegistryHandle hKey,
+        bool watchSubtree,
+        uint notifyFilter,
+        Microsoft.Win32.SafeHandles.SafeWaitHandle hEvent,
+        bool asynchronous);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
@@ -255,6 +269,8 @@ internal static class NativeMethods
     public const uint EventSystemForeground = 0x0003;
     public const uint EventSystemAlert = 0x0002;
     public const uint EventObjectFocus = 0x8005;
+    public const uint ClsctxInprocServer = 1;
+    public const uint CoinitApartmentThreaded = 2;
     public const uint WmGetObject = 0x003D;
     /// <summary>
     /// Chromium 用来探测“是否有辅助技术在运行”的自定义 object id。
@@ -283,12 +299,29 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool SendNotifyMessage(
+        IntPtr hWnd,
+        uint msg,
+        IntPtr wParam,
+        string lParam);
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SendMessageTimeout(
         IntPtr hWnd,
         uint msg,
         IntPtr wParam,
         IntPtr lParam,
+        uint flags,
+        uint timeoutMs,
+        out IntPtr result);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd,
+        uint msg,
+        IntPtr wParam,
+        string lParam,
         uint flags,
         uint timeoutMs,
         out IntPtr result);
@@ -508,6 +541,20 @@ internal static class NativeMethods
             CloseHandle(handle);
         }
     }
+
+    [DllImport("ole32.dll")]
+    public static extern int CoInitializeEx(IntPtr reserved, uint coInit);
+
+    [DllImport("ole32.dll")]
+    public static extern int CoCreateInstance(
+        ref Guid rclsid,
+        IntPtr outer,
+        uint context,
+        ref Guid iid,
+        out IntPtr ppv);
+
+    [DllImport("msctf.dll")]
+    public static extern int TF_CreateThreadMgr(out IntPtr threadMgr);
 }
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

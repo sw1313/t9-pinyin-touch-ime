@@ -91,11 +91,17 @@ internal static class Log
                     if (Queue.Count == 0)
                     {
                         writer.Flush();
+                        if (LogRetentionPolicy.ShouldRotate(writer.BaseStream.Length))
+                        {
+                            writer.Dispose();
+                            writer = null;
+                            Rotate(AppSettings.LogPath);
+                        }
                     }
                 }
                 catch
                 {
-                    writer.Dispose();
+                    writer?.Dispose();
                     writer = null;
                 }
             }
@@ -122,6 +128,7 @@ internal static class Log
     {
         try
         {
+            Rotate(AppSettings.LogPath);
             var stream = new FileStream(
                 AppSettings.LogPath,
                 FileMode.Append,
@@ -132,6 +139,26 @@ internal static class Log
         catch
         {
             return null;
+        }
+    }
+
+    private static void Rotate(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists || !LogRetentionPolicy.ShouldRotate(info.Length))
+            {
+                return;
+            }
+
+            var backup = LogRetentionPolicy.BackupPath(path);
+            File.Delete(backup);
+            File.Move(path, backup);
+        }
+        catch
+        {
+            // 打不开备份就继续往当前文件写，不能因为轮转打断输入
         }
     }
 }

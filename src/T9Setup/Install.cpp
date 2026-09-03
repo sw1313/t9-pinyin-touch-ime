@@ -92,6 +92,53 @@ namespace
         FindClose(find);
     }
 
+    void ClearReadOnly(const wchar_t* path)
+    {
+        const DWORD attr = GetFileAttributesW(path);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY))
+        {
+            SetFileAttributesW(path, attr & ~FILE_ATTRIBUTE_READONLY);
+        }
+    }
+
+    bool FileWritable(const wchar_t* path)
+    {
+        const HANDLE file = CreateFileW(
+            path,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        CloseHandle(file);
+        return true;
+    }
+
+    void WaitFileWritable(const wchar_t* path)
+    {
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
+        {
+            return;
+        }
+
+        ClearReadOnly(path);
+        for (int i = 0; i < 50; ++i)
+        {
+            if (FileWritable(path))
+            {
+                return;
+            }
+
+            Sleep(100);
+        }
+    }
+
     void KillT9Pane()
     {
         const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -120,6 +167,25 @@ namespace
         }
 
         CloseHandle(snap);
+        WaitFileWritable(DestExe().c_str());
+    }
+
+    std::wstring SourceHostExe(const std::wstring& source)
+    {
+        const wchar_t* rid = NativeArm64() ? L"win-arm64" : NativeAmd64() ? L"win-x64" : L"win-x86";
+        const std::wstring host = source + L"\\hosts\\" + rid + L"\\T9Pane.exe";
+        if (GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            return host;
+        }
+
+        const std::wstring root = source + L"\\T9Pane.exe";
+        if (GetFileAttributesW(root.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            return root;
+        }
+
+        ThrowMsg(L"安装包缺少 T9Pane.exe");
     }
 
     std::wstring NewestSignedIme(const std::wstring& dir)
@@ -398,7 +464,7 @@ namespace
             RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t)));
         };
         set(L"DisplayName", L"T9 拼音触屏输入法");
-        set(L"DisplayVersion", L"0.1.4");
+        set(L"DisplayVersion", L"0.1.14");
         set(L"Publisher", L"sw1313");
         set(L"InstallLocation", DestDir().c_str());
         set(L"DisplayIcon", DestExe().c_str());
@@ -718,21 +784,66 @@ void PatchUiAccessManifest(const wchar_t* exe, const wchar_t* manifestPath)
     ReadFile(file, xml.data(), size, &read, nullptr);
     CloseHandle(file);
 
-    const HANDLE update = BeginUpdateResourceW(exe, FALSE);
-    if (!update)
+    auto tryPatch = [&](const wchar_t* target) -> bool
     {
-        ThrowLast(L"BeginUpdateResource 失败");
+        WaitFileWritable(target);
+        const HANDLE update = BeginUpdateResourceW(target, FALSE);
+        if (!update)
+        {
+            return false;
+        }
+
+        if (!UpdateResourceW(update, MAKEINTRESOURCEW(24), MAKEINTRESOURCEW(1), 0, xml.data(), size))
+        {
+            EndUpdateResourceW(update, TRUE);
+            return false;
+        }
+
+        return EndUpdateResourceW(update, FALSE) != FALSE;
+    };
+
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        if (tryPatch(exe))
+        {
+            return;
+        }
+
+        Log(L"写入 uiAccess 清单重试 %d（错误 %u） path=%s", attempt + 1, GetLastError(), exe);
+        Sleep(150 * (attempt + 1));
     }
 
-    if (!UpdateResourceW(update, MAKEINTRESOURCEW(24), MAKEINTRESOURCEW(1), 0, xml.data(), size))
-    {
-        EndUpdateResourceW(update, TRUE);
-        ThrowLast(L"UpdateResource 失败");
-    }
-
-    if (!EndUpdateResourceW(update, FALSE))
+    const std::wstring temp = std::wstring(exe) + L".uiaccess.tmp";
+    DeleteFileW(temp.c_str());
+    if (!CopyFileW(exe, temp.c_str(), FALSE))
     {
         ThrowLast(L"EndUpdateResource 失败");
+    }
+
+    bool patched = false;
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        if (tryPatch(temp.c_str()))
+        {
+            patched = true;
+            break;
+        }
+
+        Log(L"写入临时 uiAccess 清单重试 %d（错误 %u）", attempt + 1, GetLastError());
+        Sleep(150 * (attempt + 1));
+    }
+
+    if (!patched)
+    {
+        DeleteFileW(temp.c_str());
+        ThrowLast(L"EndUpdateResource 失败");
+    }
+
+    WaitFileWritable(exe);
+    if (!MoveFileExW(temp.c_str(), exe, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileW(temp.c_str());
+        ThrowLast(L"替换已写入 uiAccess 的 T9Pane.exe 失败");
     }
 }
 
@@ -749,6 +860,14 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
 
     const std::wstring dest = DestDir();
     const std::wstring exe = DestExe();
+    wchar_t manifest[MAX_PATH]{};
+    PathCombineW(manifest, source.c_str(), L"app.uia.manifest");
+    const std::wstring host = SourceHostExe(source);
+    UiStatus(dlg, L"正在写入 uiAccess 清单并签名…");
+    PatchUiAccessManifest(host.c_str(), manifest);
+    EnsureLocalCodeSigningCert();
+    SignPeFile(host.c_str());
+
     UiStatus(dlg, L"正在清除旧输入法注册…");
     ClearOldImeInstallation(dest);
     CreateDirectoryW(dest.c_str(), nullptr);
@@ -811,13 +930,11 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     GrantAppContainerReadExecute((dest + L"\\x86").c_str(), true);
     GrantAppContainerReadExecute(ime86.c_str(), false);
 
-    wchar_t manifest[MAX_PATH]{};
-    PathCombineW(manifest, source.c_str(), L"app.uia.manifest");
-    UiStatus(dlg, L"正在写入 uiAccess 清单并签名…");
-    PatchUiAccessManifest(exe.c_str(), manifest);
-    EnsureLocalCodeSigningCert();
-    SignPeFile(exe.c_str());
     GrantAppContainerReadExecute(exe.c_str(), false);
+    if (!VerifyAuthenticode(exe.c_str()))
+    {
+        SignPeFile(exe.c_str());
+    }
     if (!VerifyAuthenticode(exe.c_str()))
     {
         ThrowMsg(L"T9Pane.exe 签名校验失败");
@@ -957,11 +1074,77 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
             L"EnableDesktopModeAutoInvoke",
             L"T9Pane.Backup.HadEnableDesktopModeAutoInvoke",
             L"T9Pane.Backup.EnableDesktopModeAutoInvoke");
+
+        HKEY input = nullptr;
+        if (RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\input\\Settings",
+                0,
+                nullptr,
+                0,
+                access,
+                nullptr,
+                &input,
+                nullptr) == ERROR_SUCCESS)
+        {
+            auto restoreInput = [&](const wchar_t* name, const wchar_t* hadName, const wchar_t* backupName)
+            {
+                DWORD had = 0;
+                DWORD hadSize = sizeof(had);
+                if (RegQueryValueExW(key, hadName, nullptr, &type, reinterpret_cast<BYTE*>(&had), &hadSize)
+                    != ERROR_SUCCESS)
+                {
+                    return;
+                }
+
+                if (had)
+                {
+                    DWORD value = 0;
+                    DWORD valueSize = sizeof(value);
+                    if (RegQueryValueExW(
+                            key,
+                            backupName,
+                            nullptr,
+                            &type,
+                            reinterpret_cast<BYTE*>(&value),
+                            &valueSize) == ERROR_SUCCESS)
+                    {
+                        RegSetValueExW(
+                            input,
+                            name,
+                            0,
+                            REG_DWORD,
+                            reinterpret_cast<const BYTE*>(&value),
+                            sizeof(value));
+                    }
+
+                    return;
+                }
+
+                RegDeleteValueW(input, name);
+            };
+            restoreInput(
+                L"TouchKeyboardTapInvoke",
+                L"T9Pane.Backup.HadTouchKeyboardTapInvoke",
+                L"T9Pane.Backup.TouchKeyboardTapInvoke");
+            restoreInput(
+                L"EnableDesktopModeAutoInvoke",
+                L"T9Pane.Backup.HadEnableDesktopModeAutoInvoke",
+                L"T9Pane.Backup.EnableDesktopModeAutoInvoke");
+            restoreInput(
+                L"TouchKeyboardInvocationPolicy",
+                L"T9Pane.Backup.HadTouchKeyboardInvocationPolicy",
+                L"T9Pane.Backup.TouchKeyboardInvocationPolicy");
+            RegCloseKey(input);
+        }
+
         RegDeleteValueW(key, L"T9Pane.Backup.Active");
         RegDeleteValueW(key, L"T9Pane.Backup.HadEnableDesktopModeAutoInvoke");
         RegDeleteValueW(key, L"T9Pane.Backup.EnableDesktopModeAutoInvoke");
         RegDeleteValueW(key, L"T9Pane.Backup.HadTouchKeyboardTapInvoke");
         RegDeleteValueW(key, L"T9Pane.Backup.TouchKeyboardTapInvoke");
+        RegDeleteValueW(key, L"T9Pane.Backup.HadTouchKeyboardInvocationPolicy");
+        RegDeleteValueW(key, L"T9Pane.Backup.TouchKeyboardInvocationPolicy");
         RegCloseKey(key);
         DWORD_PTR result = 0;
         SendMessageTimeoutW(
