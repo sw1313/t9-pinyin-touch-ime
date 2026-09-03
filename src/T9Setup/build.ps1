@@ -33,7 +33,7 @@ if (-not $vs) {
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
 $outExe = Join-Path $OutDir "T9Setup.exe"
 $cmd = @"
-call `"$vcvars`" x64
+call `"$vcvars`" x86
 cd /d `"$src`"
 rc /nologo /c 65001 /fo T9Setup.res T9Setup.rc
 if errorlevel 1 exit /b 1

@@ -25,9 +25,12 @@ void UiStatus(HWND dlg, const wchar_t* text);
 [[noreturn]] void ThrowLast(const wchar_t* what);
 [[noreturn]] void ThrowMsg(const wchar_t* what);
 
+bool NativeAmd64();
+bool NativeX86();
 std::wstring DestDir();
 std::wstring DestExe();
 std::wstring LogPath();
+std::wstring KnownFolderPath(const GUID& folder);
 
 void InstallFromSource(HWND dlg, const std::wstring& source);
 void UninstallProduct(HWND dlg);

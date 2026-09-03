@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <cstdarg>
 #include <cwctype>
+#include <knownfolders.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <string>
@@ -102,12 +103,57 @@ void UiStatus(HWND dlg, const wchar_t* text)
     throw SetupError{ what };
 }
 
+bool NativeAmd64()
+{
+    SYSTEM_INFO info{};
+    GetNativeSystemInfo(&info);
+    return info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64;
+}
+
+bool NativeX86()
+{
+    SYSTEM_INFO info{};
+    GetNativeSystemInfo(&info);
+    return info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL;
+}
+
+std::wstring KnownFolderPath(const GUID& folder)
+{
+    PWSTR path = nullptr;
+    if (FAILED(SHGetKnownFolderPath(folder, 0, nullptr, &path)) || !path)
+    {
+        return {};
+    }
+
+    std::wstring result = path;
+    CoTaskMemFree(path);
+    return result;
+}
+
 std::wstring DestDir()
 {
-    wchar_t root[MAX_PATH]{};
-    SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, SHGFP_TYPE_CURRENT, root);
+    // 安装程序是 32 位。在 64 位系统上 CSIDL_PROGRAM_FILES 会落到 (x86)，uiAccess 必须进原生 Program Files。
+    std::wstring root = NativeAmd64()
+        ? KnownFolderPath(FOLDERID_ProgramFilesX64)
+        : KnownFolderPath(FOLDERID_ProgramFiles);
+    if (root.empty())
+    {
+        wchar_t fallback[MAX_PATH]{};
+        if (NativeAmd64())
+        {
+            ExpandEnvironmentStringsW(L"%ProgramW6432%", fallback, MAX_PATH);
+        }
+
+        if (fallback[0] == 0 || fallback[0] == L'%')
+        {
+            SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, SHGFP_TYPE_CURRENT, fallback);
+        }
+
+        root = fallback;
+    }
+
     wchar_t dest[MAX_PATH]{};
-    PathCombineW(dest, root, L"T9Pane");
+    PathCombineW(dest, root.c_str(), L"T9Pane");
     return dest;
 }
 
@@ -400,11 +446,9 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmd, int)
 {
-    BOOL wow = FALSE;
-    IsWow64Process(GetCurrentProcess(), &wow);
-    if (wow)
+    if (!NativeAmd64() && !NativeX86())
     {
-        MessageBoxW(nullptr, L"请运行 64 位安装程序。", L"T9 拼音触屏输入法", MB_ICONERROR);
+        MessageBoxW(nullptr, L"只支持 32 位或 64 位 Windows。", L"T9 拼音触屏输入法", MB_ICONERROR);
         return 1;
     }
 

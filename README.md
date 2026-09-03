@@ -11,9 +11,9 @@
 
 ## 终端用户：安装现成包
 
-1. 打开 [Releases](https://github.com/sw1313/t9-pinyin-touch-ime/releases)，下载 `T9-Pinyin-Touch-IME-*-Setup.exe`。
-2. 双击安装程序，在 UAC 点「是」。没有 .NET 8 时会自动下载桌面运行时。
-3. 程序装到 `%ProgramFiles%\T9Pane`，并同时注册 **64 位和 32 位** 输入法 DLL。
+1. 打开 [Releases](https://github.com/sw1313/t9-pinyin-touch-ime/releases)，下载 `T9-Pinyin-Touch-IME-*-Setup.exe`。一份安装包同时支持 **32 位和 64 位 Windows**（Windows 11 只有 64 位）。
+2. 双击安装程序，在 UAC 点「是」。没有 .NET 8 时会自动下载对应架构的桌面运行时。
+3. 程序装到 `%ProgramFiles%\T9Pane`。64 位系统会同时注册 **64 位和 32 位** 输入法 DLL；32 位系统只注册 32 位 DLL。
 4. 按 **Win+空格** 切到 **T9 九键**。
 5. **用手指或鼠标点一下文本框**，键盘才会出现。只靠系统自动聚焦不会弹。
 
@@ -37,10 +37,11 @@ pwsh -File tools\Pack-Release.ps1
 
 ## 从源码编译
 
-需要：Windows 10/11 x64、.NET 8 SDK、PowerShell 7、带 C++ 的 Visual Studio / Build Tools。
+需要：Windows 10/11（打包机建议 x64）、.NET 8 SDK、PowerShell 7、带 C++ 的 Visual Studio / Build Tools。
 
 ```powershell
-dotnet build T9Pane.sln -c Release
+dotnet publish src\T9Pane\T9Pane.csproj -c Release -r win-x64 --self-contained false
+dotnet publish src\T9Pane\T9Pane.csproj -c Release -r win-x86 --self-contained false
 pwsh -File src\T9Ime\build.ps1 -Arch x64
 pwsh -File src\T9Ime\build.ps1 -Arch x86
 ```

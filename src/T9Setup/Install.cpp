@@ -1,6 +1,7 @@
 #include "T9Setup.h"
 
 #include <aclapi.h>
+#include <knownfolders.h>
 #include <sddl.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -62,7 +63,9 @@ namespace
 
             if (skipImeDirs
                 && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-                && (_wcsicmp(fd.cFileName, L"x64") == 0 || _wcsicmp(fd.cFileName, L"x86") == 0))
+                && (_wcsicmp(fd.cFileName, L"x64") == 0
+                    || _wcsicmp(fd.cFileName, L"x86") == 0
+                    || _wcsicmp(fd.cFileName, L"hosts") == 0))
             {
                 continue;
             }
@@ -285,6 +288,70 @@ namespace
         FreeLibrary(dll);
     }
 
+    REGSAM UninstallWow()
+    {
+        return NativeAmd64() ? KEY_WOW64_64KEY : 0;
+    }
+
+    bool SetupIsWow64()
+    {
+        BOOL wow = FALSE;
+        return IsWow64Process(GetCurrentProcess(), &wow) && wow;
+    }
+
+    std::wstring Regsvr32Path(bool for64BitIme)
+    {
+        wchar_t win[MAX_PATH]{};
+        GetWindowsDirectoryW(win, MAX_PATH);
+        std::wstring path = win;
+        if (for64BitIme)
+        {
+            path += SetupIsWow64() ? L"\\sysnative\\regsvr32.exe" : L"\\System32\\regsvr32.exe";
+        }
+        else if (NativeAmd64())
+        {
+            path += L"\\SysWOW64\\regsvr32.exe";
+        }
+        else
+        {
+            path += L"\\System32\\regsvr32.exe";
+        }
+
+        return path;
+    }
+
+    void PlacePaneHost(const std::wstring& source, const std::wstring& destExe)
+    {
+        const wchar_t* rid = NativeAmd64() ? L"win-x64" : L"win-x86";
+        const std::wstring host = source + L"\\hosts\\" + rid + L"\\T9Pane.exe";
+        if (GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            CopyOne(host, destExe);
+            return;
+        }
+
+        if (!NativeAmd64())
+        {
+            ThrowMsg(L"安装包缺少 32 位 T9Pane.exe");
+        }
+    }
+
+    void DeleteUninstallKey()
+    {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                0,
+                DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | UninstallWow(),
+                &key)
+            == ERROR_SUCCESS)
+        {
+            RegDeleteTreeW(key, L"T9PinyinTouchIME");
+            RegCloseKey(key);
+        }
+    }
+
     void WriteUninstallKey(const std::wstring& setup)
     {
         HKEY key = nullptr;
@@ -294,7 +361,7 @@ namespace
             0,
             nullptr,
             0,
-            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            KEY_SET_VALUE | UninstallWow(),
             nullptr,
             &key,
             nullptr);
@@ -543,13 +610,12 @@ void PatchUiAccessManifest(const wchar_t* exe, const wchar_t* manifestPath)
 
 void InstallFromSource(HWND dlg, const std::wstring& source)
 {
-    SYSTEM_INFO info{};
-    GetNativeSystemInfo(&info);
-    if (info.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_AMD64)
+    if (!NativeAmd64() && !NativeX86())
     {
-        ThrowMsg(L"只支持 64 位 Windows");
+        ThrowMsg(L"只支持 32 位或 64 位 Windows");
     }
 
+    const bool amd64 = NativeAmd64();
     UiStatus(dlg, L"正在停止旧进程…");
     KillT9Pane();
 
@@ -559,6 +625,7 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
 
     UiStatus(dlg, L"正在复制程序文件…");
     CopyTree(source, dest, true);
+    PlacePaneHost(source, exe);
 
     wchar_t cer[MAX_PATH]{};
     PathCombineW(cer, dest.c_str(), L"T9Ime-Development.cer");
@@ -572,15 +639,23 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
 
     std::wstring ime64;
     std::wstring ime86;
-    UiStatus(dlg, L"正在部署 x64 / x86 输入法 DLL…");
-    ime64 = DeployIme(NewestSignedIme(source + L"\\x64"), dest + L"\\x64");
+    UiStatus(dlg, amd64 ? L"正在部署 x64 / x86 输入法 DLL…" : L"正在部署 32 位输入法 DLL…");
+    if (amd64)
+    {
+        ime64 = DeployIme(NewestSignedIme(source + L"\\x64"), dest + L"\\x64");
+    }
+
     ime86 = DeployIme(NewestSignedIme(source + L"\\x86"), dest + L"\\x86");
 
     GrantAppContainerReadExecute(dest.c_str(), true);
     GrantAppContainerReadExecute(exe.c_str(), false);
-    GrantAppContainerReadExecute((dest + L"\\x64").c_str(), true);
+    if (amd64)
+    {
+        GrantAppContainerReadExecute((dest + L"\\x64").c_str(), true);
+        GrantAppContainerReadExecute(ime64.c_str(), false);
+    }
+
     GrantAppContainerReadExecute((dest + L"\\x86").c_str(), true);
-    GrantAppContainerReadExecute(ime64.c_str(), false);
     GrantAppContainerReadExecute(ime86.c_str(), false);
 
     wchar_t manifest[MAX_PATH]{};
@@ -604,31 +679,41 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
         }
     }
 
-    wchar_t sys32[MAX_PATH]{};
-    wchar_t syswow[MAX_PATH]{};
-    GetSystemDirectoryW(sys32, MAX_PATH);
-    GetWindowsDirectoryW(syswow, MAX_PATH);
-    PathAppendW(syswow, L"SysWOW64\\regsvr32.exe");
-    wchar_t reg64[MAX_PATH]{};
-    PathCombineW(reg64, sys32, L"regsvr32.exe");
+    const std::wstring reg64 = Regsvr32Path(true);
+    const std::wstring reg86 = Regsvr32Path(false);
+    const REGSAM wow64 = amd64 ? KEY_WOW64_64KEY : 0;
+    const REGSAM wow32 = amd64 ? KEY_WOW64_32KEY : 0;
 
-    UiStatus(dlg, L"正在注册输入法（含 32 位程序）…");
-    RegSvr(reg64, ime64.c_str(), true);
-    RegSvr(syswow, ime86.c_str(), true);
-    SetInproc(HKEY_CURRENT_USER, KEY_WOW64_64KEY, ime64.c_str());
-    SetInproc(HKEY_CURRENT_USER, KEY_WOW64_32KEY, ime86.c_str());
-
-    if (_wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY).c_str(), ime64.c_str()) != 0
-        || _wcsicmp(GetInproc(HKEY_CURRENT_USER, KEY_WOW64_64KEY).c_str(), ime64.c_str()) != 0
-        || _wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY).c_str(), ime86.c_str()) != 0
-        || _wcsicmp(GetInproc(HKEY_CURRENT_USER, KEY_WOW64_32KEY).c_str(), ime86.c_str()) != 0)
+    UiStatus(dlg, amd64 ? L"正在注册输入法（含 32 位程序）…" : L"正在注册 32 位输入法…");
+    if (amd64)
     {
-        ThrowMsg(L"InprocServer32 校验失败");
+        RegSvr(reg64.c_str(), ime64.c_str(), true);
+        SetInproc(HKEY_CURRENT_USER, wow64, ime64.c_str());
     }
 
-    if (!VerifyAuthenticode(ime64.c_str()) || !VerifyAuthenticode(ime86.c_str()))
+    RegSvr(reg86.c_str(), ime86.c_str(), true);
+    SetInproc(HKEY_CURRENT_USER, wow32, ime86.c_str());
+
+    if (amd64)
     {
-        ThrowMsg(L"已部署的 T9Ime DLL 签名无效");
+        if (_wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, wow64).c_str(), ime64.c_str()) != 0
+            || _wcsicmp(GetInproc(HKEY_CURRENT_USER, wow64).c_str(), ime64.c_str()) != 0
+            || _wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, wow32).c_str(), ime86.c_str()) != 0
+            || _wcsicmp(GetInproc(HKEY_CURRENT_USER, wow32).c_str(), ime86.c_str()) != 0)
+        {
+            ThrowMsg(L"InprocServer32 校验失败");
+        }
+
+        if (!VerifyAuthenticode(ime64.c_str()) || !VerifyAuthenticode(ime86.c_str()))
+        {
+            ThrowMsg(L"已部署的 T9Ime DLL 签名无效");
+        }
+    }
+    else if (_wcsicmp(GetInproc(HKEY_LOCAL_MACHINE, 0).c_str(), ime86.c_str()) != 0
+        || _wcsicmp(GetInproc(HKEY_CURRENT_USER, 0).c_str(), ime86.c_str()) != 0
+        || !VerifyAuthenticode(ime86.c_str()))
+    {
+        ThrowMsg(L"InprocServer32 或签名校验失败");
     }
 
     AddLanguageBar(true);
@@ -646,7 +731,7 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     WriteUninstallKey(uninstallDest);
     UiStatus(dlg, L"正在启动键盘后端…");
     StartViaExplorer(exe);
-    Log(L"安装完成 dest=%s", dest.c_str());
+    Log(L"安装完成 dest=%s amd64=%d", dest.c_str(), amd64 ? 1 : 0);
 }
 
 void UninstallProduct(HWND dlg)
@@ -656,18 +741,13 @@ void UninstallProduct(HWND dlg)
     const std::wstring dest = DestDir();
     const std::wstring ime64 = NewestInstalledIme(dest + L"\\x64");
     const std::wstring ime86 = NewestInstalledIme(dest + L"\\x86");
-    wchar_t sys32[MAX_PATH]{};
-    GetSystemDirectoryW(sys32, MAX_PATH);
-    wchar_t reg64[MAX_PATH]{};
-    PathCombineW(reg64, sys32, L"regsvr32.exe");
-    wchar_t syswow[MAX_PATH]{};
-    GetWindowsDirectoryW(syswow, MAX_PATH);
-    PathAppendW(syswow, L"SysWOW64\\regsvr32.exe");
+    const std::wstring reg64 = Regsvr32Path(true);
+    const std::wstring reg86 = Regsvr32Path(false);
     if (!ime64.empty())
     {
         try
         {
-            RegSvr(reg64, ime64.c_str(), false);
+            RegSvr(reg64.c_str(), ime64.c_str(), false);
         }
         catch (...)
         {
@@ -678,7 +758,7 @@ void UninstallProduct(HWND dlg)
     {
         try
         {
-            RegSvr(syswow, ime86.c_str(), false);
+            RegSvr(reg86.c_str(), ime86.c_str(), false);
         }
         catch (...)
         {
@@ -693,16 +773,25 @@ void UninstallProduct(HWND dlg)
     op.pFrom = from;
     op.fFlags = FOF_NO_UI | FOF_NOCONFIRMATION | FOF_SILENT;
     SHFileOperationW(&op);
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\T9PinyinTouchIME");
+    DeleteUninstallKey();
     Log(L"卸载完成");
 }
 
 bool EnsureDotNetRuntime(HWND dlg)
 {
-    wchar_t root[MAX_PATH]{};
-    SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, SHGFP_TYPE_CURRENT, root);
+    const bool amd64 = NativeAmd64();
+    std::wstring root = amd64
+        ? KnownFolderPath(FOLDERID_ProgramFilesX64)
+        : KnownFolderPath(FOLDERID_ProgramFiles);
+    if (root.empty())
+    {
+        wchar_t fallback[MAX_PATH]{};
+        SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, SHGFP_TYPE_CURRENT, fallback);
+        root = fallback;
+    }
+
     wchar_t dir[MAX_PATH]{};
-    PathCombineW(dir, root, L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
+    PathCombineW(dir, root.c_str(), L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
     const std::wstring pattern = std::wstring(dir) + L"\\8.*";
     WIN32_FIND_DATAW fd{};
     const HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
@@ -712,13 +801,18 @@ bool EnsureDotNetRuntime(HWND dlg)
         return true;
     }
 
+    const wchar_t* rid = amd64 ? L"win-x64" : L"win-x86";
+    wchar_t url[160]{};
+    swprintf_s(url, L"https://aka.ms/dotnet/8.0/windowsdesktop-runtime-%s.exe", rid);
     UiStatus(dlg, L"未检测到 .NET 8 桌面运行时，正在下载…");
     wchar_t tmp[MAX_PATH]{};
     GetTempPathW(MAX_PATH, tmp);
-    PathAppendW(tmp, L"windowsdesktop-runtime-8.0-win-x64.exe");
+    wchar_t name[64]{};
+    swprintf_s(name, L"windowsdesktop-runtime-8.0-%s.exe", rid);
+    PathAppendW(tmp, name);
     HRESULT hr = URLDownloadToFileW(
         nullptr,
-        L"https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe",
+        url,
         tmp,
         0,
         nullptr);

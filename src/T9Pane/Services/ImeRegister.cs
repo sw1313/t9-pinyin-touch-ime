@@ -14,8 +14,16 @@ internal static class ImeRegister
     public static void PointToNewestDll()
     {
         const string clsid = "{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}";
-        TryPoint(Path.Combine(InstallDir, "x64"), $@"Software\Classes\CLSID\{clsid}\InprocServer32");
-        TryPoint(Path.Combine(InstallDir, "x86"), $@"Software\Classes\Wow6432Node\CLSID\{clsid}\InprocServer32");
+        var plan = SetupArchPolicy.ForCurrentProcess();
+        if (plan.InstallX64Ime)
+        {
+            TryPoint(Path.Combine(InstallDir, "x64"), SetupArchPolicy.X64InprocKey(clsid));
+        }
+
+        if (plan.InstallX86Ime)
+        {
+            TryPoint(Path.Combine(InstallDir, "x86"), SetupArchPolicy.X86InprocKey(plan, clsid));
+        }
     }
 
     private static void TryPoint(string dir, string keyPath)
@@ -96,7 +104,8 @@ internal static class ImeRegister
         key?.SetValue("InstallDir", InstallDir);
 
         var ok = true;
-        foreach (var arch in new[] { "x64", "x86" })
+        var plan = SetupArchPolicy.ForCurrentProcess();
+        foreach (var arch in SetupArchPolicy.ImeArches(plan))
         {
             var dll = NewestDll(Path.Combine(InstallDir, arch));
 
@@ -112,9 +121,7 @@ internal static class ImeRegister
             {
                 FileName = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                    arch == "x86"
-                        ? @"SysWOW64\regsvr32.exe"
-                        : @"System32\regsvr32.exe"),
+                    SetupArchPolicy.Regsvr32RelativePath(plan, arch)),
                 Arguments = $"/s {args}",
                 UseShellExecute = true,
                 Verb = "runas"

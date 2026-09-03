@@ -13,13 +13,27 @@ $name = "T9-Pinyin-Touch-IME-$version"
 $release = Join-Path $root "src\T9Pane\bin\Release\net8.0-windows"
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "payload"
+$x86Out = Join-Path $dist "publish-win-x86"
 $zip = Join-Path $dist "payload.zip"
 $setup = Join-Path $dist "$name-Setup.exe"
 
-Write-Host "构建托管程序 Release $version"
-dotnet build $csproj -c Release --nologo
+Write-Host "发布 64 位 / 32 位托管程序 $version"
+if (Test-Path -LiteralPath $stage) {
+    Remove-Item -LiteralPath $stage -Recurse -Force
+}
+
+dotnet publish $csproj -c Release -r win-x64 --self-contained false -o $stage --nologo
 if ($LASTEXITCODE -ne 0) {
-    throw "dotnet build 失败"
+    throw "dotnet publish win-x64 失败"
+}
+
+if (Test-Path -LiteralPath $x86Out) {
+    Remove-Item -LiteralPath $x86Out -Recurse -Force
+}
+
+dotnet publish $csproj -c Release -r win-x86 --self-contained false -o $x86Out --nologo
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet publish win-x86 失败"
 }
 
 Write-Host "构建 TSF DLL x64 / x86"
@@ -30,24 +44,19 @@ foreach ($arch in "x64", "x86") {
     }
 }
 
-if (Test-Path -LiteralPath $stage) {
-    Remove-Item -LiteralPath $stage -Recurse -Force
-}
-New-Item -ItemType Directory -Force -Path $dist, $stage | Out-Null
-
-Get-ChildItem -LiteralPath $release | ForEach-Object {
-    if ($_.PSIsContainer -and $_.Name -in @("x64", "x86")) {
-        return
-    }
-    if ($_.Extension -in ".pdb", ".xml") {
-        return
-    }
-    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage $_.Name) -Recurse -Force
-}
-
+New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Get-ChildItem -LiteralPath $stage -Recurse -Include *.pdb, *.xml | Remove-Item -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $stage "Tools\Test-UwpIme.ps1") -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $stage "Tools\Install-UiAccess.ps1") -Force -ErrorAction SilentlyContinue
+
+$host64 = Join-Path $stage "hosts\win-x64"
+$host86 = Join-Path $stage "hosts\win-x86"
+New-Item -ItemType Directory -Force -Path $host64, $host86 | Out-Null
+Copy-Item -LiteralPath (Join-Path $stage "T9Pane.exe") -Destination (Join-Path $host64 "T9Pane.exe") -Force
+Copy-Item -LiteralPath (Join-Path $x86Out "T9Pane.exe") -Destination (Join-Path $host86 "T9Pane.exe") -Force
+if (-not (Test-Path -LiteralPath (Join-Path $host86 "T9Pane.exe"))) {
+    throw "缺少 32 位 T9Pane.exe"
+}
 
 foreach ($arch in "x64", "x86") {
     $imeDir = Join-Path $release $arch
