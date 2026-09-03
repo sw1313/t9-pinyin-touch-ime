@@ -1,0 +1,8 @@
+LIBRARY T9Ime
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
+    DllRegisterServer PRIVATE
+    DllUnregisterServer PRIVATE
+    T9ImeClearDefault
+    T9ImeActivate

@@ -1,0 +1,29 @@
+# 网址/邮箱快捷短语。触发码是字母，不是九键数字。
+# 格式：上屏内容<TAB>触发<TAB>词频
+---
+name: shortcuts
+version: "2026-09-03"
+sort: by_weight
+...
+
+http://	h	50000
+https://	h	49900
+http://	http	48000
+https://	https	47900
+www.	w	45000
+www.	www	44900
+ftp://	ftp	40000
+mailto:	mail	39000
+mailto:	mailto	38900
+.com	com	36000
+.cn	cn	35000
+.org	org	34000
+.net	net	33000
+.edu	edu	32000
+.gov	gov	31000
+.html	html	30000
+.json	json	29000
+@gmail.com	gmail	28000
+@outlook.com	outlook	27000
+@qq.com	qq	26000
+localhost	local	20000

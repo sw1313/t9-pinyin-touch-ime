@@ -1,0 +1,11 @@
+本目录是随输入法分发的开源词库，不是本项目原创字典。
+
+打包来源（GPL-3.0）：
+https://github.com/HuanSoft-Open-Source-Community/xiaobai-t9
+路径：output/data/dicts/
+
+各文件还保留自己的上游头注释，完整署名见仓库根目录 THIRD_PARTY.md。
+主要上游：
+- amzxyz/RIME-LMDG（CC BY 4.0）：jichu / zi / duoyin / cn&en
+- iDvel/rime-ice（GPL-3.0）：en / en_ext / word / punctuation
+- rime-luna-pinyin（LGPL-3.0）、rime-pinyin-simp（Apache-2.0）

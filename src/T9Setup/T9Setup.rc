@@ -1,0 +1,17 @@
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+
+1 RT_MANIFEST "T9Setup.manifest"
+
+IDD_MAIN DIALOGEX 0, 0, 300, 96
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "T9 Pinyin Touch IME"
+FONT 9, "MS Shell Dlg 2"
+BEGIN
+    LTEXT "正在准备安装…", IDC_STATUS, 12, 10, 276, 36
+    CONTROL "", IDC_PROGRESS, PROGRESS_CLASS, PBS_SMOOTH | WS_BORDER, 12, 50, 276, 11
+    DEFPUSHBUTTON "关闭", IDC_CLOSE, 230, 72, 58, 16, WS_DISABLED
+END
+
+IDR_PAYLOAD RCDATA "payload.zip"

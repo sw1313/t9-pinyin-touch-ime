@@ -1,0 +1,16 @@
+* text=auto eol=lf
+*.cs text eol=crlf
+*.xaml text eol=crlf
+*.sln text eol=crlf
+*.csproj text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.cpp text eol=crlf
+*.h text eol=crlf
+*.def text eol=crlf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+src/T9Pane/Data/xiaobai-t9/*.dict.yaml linguist-vendored

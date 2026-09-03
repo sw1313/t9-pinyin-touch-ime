@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon />
+    <RootNamespace>T9Pane</RootNamespace>
+    <AssemblyName>T9Pane</AssemblyName>
+    <Product>T9 拼音触屏输入法</Product>
+    <Description>Windows 九键/26键触屏拼音输入法</Description>
+    <Version>0.1.0</Version>
+    <Authors>sw1313</Authors>
+    <Copyright>Copyright (C) 2026 sw1313</Copyright>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/sw1313/t9-pinyin-touch-ime</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sw1313/t9-pinyin-touch-ime</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="T9Pane.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="Data\xiaobai-t9\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Tools\Install-UiAccess.ps1">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Tools\Test-UwpIme.ps1">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="app.uia.manifest">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>
