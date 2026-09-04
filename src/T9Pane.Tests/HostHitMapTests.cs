@@ -1,4 +1,5 @@
 using System.Windows.Automation;
+using System.Windows.Threading;
 using T9Pane.Native;
 using T9Pane.Services;
 
@@ -6,6 +7,40 @@ namespace T9Pane.Tests;
 
 public class HostHitMapTests
 {
+    [Fact]
+    public void Hosted_hidden_window_still_collects_laid_out_keys()
+    {
+        Assert.True(HostHitMap.ShouldCollect(
+            layoutVisible: true,
+            enabled: true,
+            renderWidth: 80,
+            renderHeight: 64));
+        Assert.False(HostHitMap.ShouldCollect(
+            layoutVisible: false,
+            enabled: true,
+            renderWidth: 80,
+            renderHeight: 64));
+        Assert.False(HostHitMap.ShouldCollect(
+            layoutVisible: true,
+            enabled: true,
+            renderWidth: 1,
+            renderHeight: 64));
+        Assert.False(HostHitMap.ShouldReplaceRegions(incomingCount: 0, existingCount: 12));
+        Assert.True(HostHitMap.ShouldReplaceRegions(incomingCount: 12, existingCount: 12));
+        Assert.True(HostHitMap.ShouldReplaceRegions(incomingCount: 0, existingCount: 0));
+        Assert.True(HostHitMap.CoversFrameHeight(380, 400));
+        Assert.False(HostHitMap.CoversFrameHeight(120, 400));
+        Assert.True(HostHitMap.IsLayoutCollapsed(80, 404));
+        Assert.False(HostHitMap.IsLayoutCollapsed(404, 404));
+        Assert.False(HostHitMap.ShouldReplaceRegions(8, 16, incomingCoversFrame: false));
+        Assert.True(HostHitMap.CountsAsExpected(layoutVisible: true, enabled: true));
+        Assert.False(HostHitMap.CountsAsExpected(layoutVisible: false, enabled: true));
+        Assert.True(HostHitMap.ShouldRetryAfterRebuild(collected: 4, expected: 16));
+        Assert.False(HostHitMap.ShouldRetryAfterRebuild(collected: 16, expected: 16));
+        Assert.False(HostHitMap.ShouldRetryAfterRebuild(collected: 0, expected: 0));
+        Assert.Equal(DispatcherPriority.Loaded, HostFrame.PublishPriority);
+    }
+
     [Fact]
     public void Captured_pixel_coordinates_select_the_button_region()
     {
@@ -18,6 +53,109 @@ public class HostHitMapTests
         Assert.Equal("5", HostHitMap.Find(regions, 208, 276));
         Assert.Equal("6", HostHitMap.Find(regions, 400, 276));
         Assert.Null(HostHitMap.Find(regions, 99, 276));
+    }
+
+    [Fact]
+    public void Dpi_virtualized_search_host_clicks_map_onto_the_physical_frame()
+    {
+        // 0.1.48 开始菜单搜索：客户区 400×404（96 DPI），帧 600×606（150%），
+        // 点 (231,316) 对不上物理命中图；还原后应落在同一颗键上。
+        var mapped = HostHitMap.MapClientToFrame(231, 316, 400, 404, 600, 606);
+        Assert.Equal(347, mapped.X);
+        Assert.Equal(474, mapped.Y);
+        Assert.Equal((231, 316), HostHitMap.MapClientToFrame(231, 316, 600, 606, 600, 606));
+
+        HostHitRegion<string>[] regions =
+        [
+            new(300, 420, 400, 520, "8")
+        ];
+        Assert.Null(HostHitMap.Find(regions, 231, 316));
+        Assert.Equal("8", HostHitMap.Find(regions, mapped.X, mapped.Y));
+    }
+
+    [Fact]
+    public void Search_host_pixel_click_maps_onto_dip_key_regions()
+    {
+        // 0.1.51 开始菜单搜索：命中图 34 键仍在 DIP（DEF 约 244–332,132–220），
+        // Band 上报的是 150% 位图像素 (394,257)。换到布局空间后应点中。
+        HostHitRegion<string>[] keys =
+        [
+            new(244, 132, 332, 220, "DEF"),
+            new(156, 308, 244, 396, "TUV")
+        ];
+
+        Assert.Equal(
+            "DEF",
+            HostHitMap.FindLayout(keys, 394, 257, 400, 404, 600, 606));
+        Assert.Equal(
+            "TUV",
+            HostHitMap.FindLayout(keys, 231, 316, 400, 404, 600, 606));
+        Assert.Equal(
+            "DEF",
+            HostHitMap.FindLayout(keys, 270, 170, 400, 404, 400, 404));
+        Assert.Null(HostHitMap.FindLayout(keys, 20, 20, 400, 404, 600, 606));
+    }
+
+    [Fact]
+    public void Scaled_click_never_falls_back_to_the_wrong_key_via_raw_coordinates()
+    {
+        // 150% 下物理坐标几乎总落在 DIP 命中图范围内。先试原值就会稳定命中错键，
+        // 而且一条「未命中」都不会报——看着像修好了，实际按哪儿都错位。
+        HostHitRegion<string>[] board =
+        [
+            new(60, 132, 148, 220, "分词"),
+            new(148, 220, 236, 308, "JKL")
+        ];
+
+        // 点「分词」正中，150% 下上报 (156,264)：原值会落进 JKL。
+        Assert.Equal("JKL", HostHitMap.Find(board, 156, 264));
+        Assert.Equal(
+            "分词",
+            HostHitMap.FindLayout(board, 156, 264, 400, 404, 600, 606, out var space));
+        Assert.Equal("px→dip", space);
+
+        // 缩放为 1 时仍按原值判定。
+        Assert.Equal(
+            "JKL",
+            HostHitMap.FindLayout(board, 156, 264, 400, 404, 400, 404, out var same));
+        Assert.Equal("raw", same);
+    }
+
+    [Fact]
+    public void Search_compose_payload_keeps_pinyin_and_packs_candidates()
+    {
+        var packed = SearchCandidatePayload.Encode("nihao", ["你好", "拟好", "逆号"]);
+        Assert.Equal("nihao", SearchCandidatePayload.ComposeText(packed));
+        Assert.Contains('\u001e', packed);
+        Assert.Equal("nihao", SearchCandidatePayload.ComposeText("nihao"));
+        Assert.Equal("", SearchCandidatePayload.ComposeText(""));
+        Assert.Equal(ImeHost.KindSearchCandidates, 9);
+    }
+
+    [Fact]
+    public void Candidate_buttons_upsert_into_an_existing_hit_map()
+    {
+        var keys = new List<HostHitRegion<string>>
+        {
+            new(60, 132, 148, 220, "分词"),
+            new(332, 80, 392, 168, "退格")
+        };
+        var candidates = new List<HostHitRegion<string>>
+        {
+            new(100, 50, 160, 78, "你好")
+        };
+
+        HostHitMap.Upsert(keys, candidates);
+        Assert.Equal(3, keys.Count);
+        Assert.Equal("你好", HostHitMap.Find(keys, 120, 60));
+        Assert.Equal("退格", HostHitMap.Find(keys, 350, 120));
+
+        HostHitMap.Upsert(keys, [new(110, 50, 170, 78, "你好")]);
+        Assert.Equal(3, keys.Count);
+        Assert.Equal("你好", HostHitMap.Find(keys, 165, 60));
+
+        HostHitMap.RemoveTarget(keys, "你好");
+        Assert.Null(HostHitMap.Find(keys, 165, 60));
     }
 
     [Fact]
@@ -269,9 +407,8 @@ public class HostHitMapTests
     }
 
     [Fact]
-    public void Unavailable_hit_never_resolves_on_a_clock()
+    public void Unavailable_hit_waits_then_expires_without_spinning()
     {
-        // SampleIME：看不清这一拍就不决断。已显示也不用超时收起。
         Assert.False(KeyboardInvocationPolicy.TryResolvePointer(
             PointerInputHit.Unavailable,
             systemTextHost: false,
@@ -280,22 +417,74 @@ public class HostHitMapTests
             userDismissed: false,
             expired: false,
             out _));
-        Assert.False(KeyboardInvocationPolicy.TryResolvePointer(
+        Assert.True(KeyboardInvocationPolicy.TryResolvePointer(
             PointerInputHit.Unavailable,
             systemTextHost: false,
             origin: PointerInvocationOrigin.Unknown,
             previouslyAuthorized: true,
             userDismissed: false,
             expired: true,
-            out _));
-        Assert.False(KeyboardInvocationPolicy.TryResolvePointer(
+            out var stillAuthorized));
+        Assert.False(stillAuthorized);
+        Assert.True(KeyboardInvocationPolicy.TryResolvePointer(
             PointerInputHit.Unavailable,
             systemTextHost: false,
             origin: PointerInvocationOrigin.Unknown,
             previouslyAuthorized: false,
             userDismissed: false,
             expired: true,
-            out _));
+            out var authorized));
+        Assert.False(authorized);
+    }
+
+    [Fact]
+    public void Touch_invocation_promotes_chromium_document_hits()
+    {
+        Assert.Equal(
+            PointerInputHit.Inside,
+            TouchInvocationPolicy.Promote(
+                PointerInputHit.Unavailable,
+                textIntent: true,
+                authorized: false,
+                clickInsideAuthorizedField: false));
+        Assert.Equal(
+            PointerInputHit.Outside,
+            TouchInvocationPolicy.Promote(
+                PointerInputHit.Unavailable,
+                textIntent: true,
+                authorized: true,
+                clickInsideAuthorizedField: false));
+        Assert.Equal(
+            PointerInputHit.Inside,
+            TouchInvocationPolicy.Promote(
+                PointerInputHit.Unavailable,
+                textIntent: false,
+                authorized: true,
+                clickInsideAuthorizedField: true));
+        Assert.Equal(
+            PointerInputHit.Unavailable,
+            TouchInvocationPolicy.Promote(
+                PointerInputHit.Unavailable,
+                textIntent: false,
+                authorized: false,
+                clickInsideAuthorizedField: false));
+        Assert.False(TouchInvocationPolicy.CountsAsLeaveClick(PointerInputHit.Unavailable));
+        Assert.True(TouchInvocationPolicy.CountsAsLeaveClick(PointerInputHit.Outside));
+        Assert.True(TouchInvocationPolicy.IsTextIntent(true, false, false));
+        Assert.True(TouchInvocationPolicy.IsPromotedTouch(0xFF515700));
+        Assert.False(TouchInvocationPolicy.IsPromotedTouch(0));
+    }
+
+    [Fact]
+    public void Touch_down_dedupes_promoted_mouse_and_hid()
+    {
+        const long tick = TimeSpan.TicksPerMillisecond;
+        Assert.True(PointerIntentTrackingPolicy.IsDuplicateDown(
+            10, 10, 12, 11, 50 * tick, 10 * tick));
+        Assert.False(PointerIntentTrackingPolicy.IsDuplicateDown(
+            10, 10, 12, 11, 80 * tick, 10 * tick));
+        Assert.True(PointerIntentTrackingPolicy.IsNewContactBurst(90 * tick, 10 * tick));
+        Assert.False(PointerIntentTrackingPolicy.IsNewContactBurst(50 * tick, 10 * tick));
     }
 
     [Fact]
@@ -320,11 +509,14 @@ public class HostHitMapTests
             searchSession: true,
             hasUnresolvedLeaveClick: true));
         // 没有这一次离开点击，只是 Chromium 短暂 SetFocus(null)，不藏。
+        // 平板也不能豁免：日志里授权后十几毫秒就「文档焦点离开」再立刻再授权。
         Assert.False(KeyboardInvocationPolicy.ShouldDismissForLostDocument(
             documentFocused: false,
             uiaLooksLikeTextInput: false,
             searchSession: false,
             hasUnresolvedLeaveClick: false));
+        Assert.False(KeyboardInvocationPolicy.ShouldReauthorizeAfterRevoke(true));
+        Assert.True(KeyboardInvocationPolicy.ShouldReauthorizeAfterRevoke(false));
     }
 
     [Fact]
@@ -537,10 +729,50 @@ public class HostHitMapTests
     [Fact]
     public void Search_suggestion_list_item_is_not_leaving_the_input()
     {
-        // 搜索框弹出后焦点会落到联想 ListItem，这仍属于同一 TSF 文档。
-        Assert.False(InputInvocationProbe.SignalsLeftTextInput(ControlType.ListItem));
+        // 侧栏列表/文件树是离开；搜索联想仍由 searchSession 在会话里挡住。
+        Assert.True(InputInvocationProbe.SignalsLeftTextInput(ControlType.ListItem));
+        Assert.True(InputInvocationProbe.SignalsLeftTextInput(ControlType.TreeItem));
         Assert.True(InputInvocationProbe.SignalsLeftTextInput(ControlType.Button));
         Assert.True(InputInvocationProbe.StopsAtControl(ControlType.ListItem));
+        Assert.False(InputInvocationProbe.SignalsLeftTextInput(ControlType.Thumb));
+        Assert.False(InputInvocationProbe.SignalsLeftTextInput(ControlType.ScrollBar));
+        Assert.True(InputInvocationProbe.StopsAtControl(ControlType.Thumb));
+        Assert.True(KeyboardInvocationPolicy.ShouldIgnoreFocusLeft(
+            documentFocused: true,
+            slateDevice: true,
+            selectionChrome: true));
+        Assert.False(KeyboardInvocationPolicy.ShouldIgnoreFocusLeft(
+            documentFocused: true,
+            slateDevice: true,
+            selectionChrome: false));
+        Assert.False(KeyboardInvocationPolicy.ShouldIgnoreFocusLeft(
+            documentFocused: false,
+            slateDevice: true,
+            selectionChrome: true));
+        Assert.False(KeyboardInvocationPolicy.ShouldIgnoreFocusLeft(
+            documentFocused: true,
+            slateDevice: false,
+            selectionChrome: true));
+        Assert.True(InputInvocationProbe.IsSelectionChrome(ControlType.Menu));
+        Assert.True(InputInvocationProbe.IsSelectionChrome(ControlType.Thumb));
+        Assert.False(InputInvocationProbe.IsSelectionChrome(ControlType.Button));
+        Assert.False(InputInvocationProbe.IsSelectionChrome(ControlType.ToolBar));
+        Assert.True(InputInvocationProbe.SignalsLeftPageSurface(
+            ControlType.Document, width: 1600, height: 900, keyboardFocusable: true));
+        Assert.False(InputInvocationProbe.SignalsLeftPageSurface(
+            ControlType.Document, width: 280, height: 36, keyboardFocusable: true));
+        Assert.True(KeyboardInvocationPolicy.ShouldAuthorizeSlateOcclusion(
+            slateDevice: true,
+            hasInputField: true,
+            focusEnteredTextInput: true,
+            pointerOnOfficialSip: false,
+            pageSurface: true));
+        Assert.False(KeyboardInvocationPolicy.ShouldAuthorizeSlateOcclusion(
+            slateDevice: true,
+            hasInputField: true,
+            focusEnteredTextInput: false,
+            pointerOnOfficialSip: false,
+            pageSurface: true));
     }
 
     [Fact]
@@ -598,13 +830,296 @@ public class HostHitMapTests
     }
 
     [Fact]
+    public void Address_bar_select_all_shows_touch_selection_hides()
+    {
+        Assert.False(SelectionVisibilityPolicy.ShouldHide(touchSelectionChrome: false));
+        Assert.False(SelectionVisibilityPolicy.ShouldHide(
+            touchSelectionChrome: true,
+            rangeSelected: false));
+        Assert.True(SelectionVisibilityPolicy.ShouldHide(
+            touchSelectionChrome: true,
+            rangeSelected: true));
+        Assert.True(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: false,
+            focusedLooksLikeText: false,
+            focusEnteredText: false,
+            selectionChrome: false));
+        Assert.False(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: false,
+            focusedLooksLikeText: false,
+            focusEnteredText: false,
+            selectionChrome: false,
+            nearbyFieldChrome: false,
+            searchSession: true));
+        Assert.False(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: false,
+            focusedLooksLikeText: true,
+            focusEnteredText: false,
+            selectionChrome: false));
+        Assert.False(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: true,
+            focusedLooksLikeText: false,
+            focusEnteredText: false,
+            selectionChrome: false));
+        Assert.True(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: false,
+            focusedLooksLikeText: false,
+            focusEnteredText: false,
+            selectionChrome: false,
+            nearbyFieldChrome: false));
+        Assert.False(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: false,
+            focusedLooksLikeText: false,
+            focusEnteredText: false,
+            selectionChrome: false,
+            nearbyFieldChrome: true));
+        var address = new NativeRect { Left = 80, Top = 40, Right = 900, Bottom = 80 };
+        var refresh = new NativeRect { Left = 860, Top = 44, Right = 896, Bottom = 76 };
+        var sidebar = new NativeRect { Left = 8, Top = 160, Right = 280, Bottom = 800 };
+        Assert.True(SipVisibilityPolicy.IsNearbyFieldChrome(address, refresh));
+        Assert.False(SipVisibilityPolicy.IsNearbyFieldChrome(address, sidebar));
+        Assert.False(TouchFocusLeavePolicy.ShouldRevokeNow(
+            focusLeft: true,
+            selectionChrome: false,
+            looksLikeText: false,
+            documentFocused: true,
+            touchInvocation: true));
+        Assert.True(TouchFocusLeavePolicy.ShouldRevokeNow(
+            focusLeft: true,
+            selectionChrome: false,
+            looksLikeText: false,
+            documentFocused: false,
+            touchInvocation: true));
+        Assert.True(TouchFocusLeavePolicy.ShouldRevokeNow(
+            focusLeft: true,
+            selectionChrome: false,
+            looksLikeText: false,
+            documentFocused: true,
+            touchInvocation: false));
+        Assert.False(TouchFocusLeavePolicy.ShouldRevokeNow(
+            focusLeft: true,
+            selectionChrome: true,
+            looksLikeText: false,
+            documentFocused: false,
+            touchInvocation: true));
+        Assert.True(TouchFocusLeavePolicy.ShouldRevokeForPageTap(
+            touchDismissArmed: true,
+            pageSurface: true,
+            selectionChrome: false,
+            looksLikeText: false,
+            focusEntered: false));
+        Assert.False(TouchFocusLeavePolicy.ShouldRevokeForPageTap(
+            touchDismissArmed: true,
+            pageSurface: true,
+            selectionChrome: false,
+            looksLikeText: true,
+            focusEntered: false));
+        Assert.True(TouchFocusLeavePolicy.ShouldRevokeAfterConfirm(
+            confirmExpired: true,
+            selectionChrome: false,
+            looksLikeText: false,
+            focusEntered: false,
+            pageSurface: false,
+            focusLeft: true,
+            touchDismissArmed: false));
+        Assert.False(TouchFocusLeavePolicy.ShouldRevokeAfterConfirm(
+            confirmExpired: true,
+            selectionChrome: false,
+            looksLikeText: true,
+            focusEntered: false,
+            pageSurface: true,
+            focusLeft: true,
+            touchDismissArmed: true));
+    }
+
+    [Fact]
+    public void Touch_focus_shows_without_matching_a_stale_cursor()
+    {
+        Assert.True(TouchInvocationPolicy.ShouldShowForTouchFocus(
+            touchInvocation: true,
+            documentHasCaret: true,
+            focusEntered: false,
+            focusedLooksLikeText: false,
+            editTap: true));
+        Assert.True(TouchInvocationPolicy.ShouldShowForTouchFocus(
+            touchInvocation: true,
+            documentHasCaret: false,
+            focusEntered: true,
+            focusedLooksLikeText: false,
+            editTap: true));
+        Assert.False(TouchInvocationPolicy.ShouldShowForTouchFocus(
+            touchInvocation: true,
+            documentHasCaret: true,
+            focusEntered: true,
+            focusedLooksLikeText: true,
+            editTap: false));
+        Assert.False(TouchInvocationPolicy.ShouldShowForTouchFocus(
+            touchInvocation: false,
+            documentHasCaret: true,
+            focusEntered: true,
+            focusedLooksLikeText: true,
+            editTap: true));
+        Assert.Equal(EditTouch.KindOnLeave, EditTouchPolicy.Classify(onText: false, onLeave: true));
+        Assert.Equal(EditTouch.KindOnEdit, EditTouchPolicy.Classify(onText: true, onLeave: false));
+        Assert.False(EditTouchPolicy.AllowsShow(
+            EditTouch.KindOnLeave,
+            nowLooksLikeText: true,
+            ageMs: 80));
+        Assert.True(EditTouchPolicy.AllowsShow(
+            EditTouch.KindOnEdit,
+            nowLooksLikeText: true,
+            ageMs: 80));
+        Assert.True(EditTouchPolicy.AllowsShow(
+            EditTouch.KindPending,
+            nowLooksLikeText: true,
+            ageMs: 80));
+        Assert.False(EditTouchPolicy.AllowsShow(
+            EditTouch.KindPending,
+            nowLooksLikeText: true,
+            ageMs: 400));
+        Assert.True(InputInvocationProbe.IsHardLeaveControl(
+            System.Windows.Automation.ControlType.TreeItem));
+        Assert.False(InputInvocationProbe.IsHardLeaveControl(
+            System.Windows.Automation.ControlType.Button));
+        Assert.True(SipFocusTrackingPolicy.ShouldIgnoreClickGeometry(
+            sipTouchGesture: true,
+            overlayOwnsTouch: false,
+            hasScreenPoint: false));
+        Assert.True(SipFocusTrackingPolicy.ShouldIgnoreClickGeometry(
+            sipTouchGesture: true,
+            overlayOwnsTouch: true,
+            hasScreenPoint: false));
+        Assert.False(SipFocusTrackingPolicy.ShouldIgnoreClickGeometry(
+            sipTouchGesture: true,
+            overlayOwnsTouch: false,
+            hasScreenPoint: true));
+        Assert.True(SipFocusTrackingPolicy.ShouldRepositionForTouchInvoke(
+            sipTouchGesture: true,
+            overlayOwnsTouch: false));
+        Assert.False(SipFocusTrackingPolicy.ShouldRepositionForTouchInvoke(
+            sipTouchGesture: true,
+            overlayOwnsTouch: true));
+        Assert.False(SipFocusTrackingPolicy.ShouldRepositionForTouchInvoke(
+            sipTouchGesture: false,
+            overlayOwnsTouch: false));
+        Assert.True(SipFocusTrackingPolicy.ShouldHoldHideForFocusQuery(
+            authorized: false,
+            gestureRecent: true,
+            focusedText: true));
+        Assert.False(SipFocusTrackingPolicy.ShouldHoldHideForFocusQuery(
+            authorized: false,
+            gestureRecent: true,
+            focusedText: false));
+        Assert.True(SipFocusTrackingPolicy.OwnsCurrentContact(
+            liveOverOverlay: true,
+            overlayContactFresh: false));
+        Assert.True(SipFocusTrackingPolicy.OwnsCurrentContact(
+            liveOverOverlay: false,
+            overlayContactFresh: true));
+        Assert.False(SipFocusTrackingPolicy.OwnsCurrentContact(
+            liveOverOverlay: false,
+            overlayContactFresh: false));
+        Assert.True(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: false,
+            focusedLooksLikeText: false,
+            focusEnteredText: false,
+            selectionChrome: false));
+        Assert.False(SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+            touchSettled: true,
+            overlayOwnsTouch: true,
+            focusedLooksLikeText: false,
+            focusEnteredText: false,
+            selectionChrome: false));
+        Assert.Equal(
+            EditTouch.KindPending,
+            EditTouchPolicy.Classify(onText: false, onLeave: false));
+        Assert.True(FieldClickPolicy.Trusts(
+            fromClicked: false,
+            default,
+            new NativeRect { Left = 681, Top = 1044, Right = 683, Bottom = 1076 },
+            987,
+            362,
+            hasScreenPoint: false,
+            touchInvocation: true));
+        Assert.False(FieldClickPolicy.Trusts(
+            fromClicked: false,
+            default,
+            new NativeRect { Left = 681, Top = 1044, Right = 683, Bottom = 1076 },
+            987,
+            362,
+            hasScreenPoint: true,
+            touchInvocation: true));
+        Assert.True(TouchDevicePolicy.PreferTouchInvocation(
+            hasTouchScreen: true,
+            slateMode: false,
+            recentTouch: true));
+        Assert.False(TouchDevicePolicy.PreferTouchInvocation(
+            hasTouchScreen: true,
+            slateMode: false,
+            recentTouch: false));
+    }
+
+    [Fact]
+    public void Slate_focus_can_open_keyboard_without_a_promoted_mouse_click()
+    {
+        Assert.True(KeyboardInvocationPolicy.ShouldAuthorizeSlateFocus(
+            slateDevice: true,
+            focusedLooksLikeTextInput: true));
+        Assert.False(KeyboardInvocationPolicy.ShouldAuthorizeSlateFocus(
+            slateDevice: false,
+            focusedLooksLikeTextInput: true));
+        Assert.False(KeyboardInvocationPolicy.ShouldAuthorizeSlateFocus(
+            slateDevice: true,
+            focusedLooksLikeTextInput: false));
+        Assert.True(KeyboardInvocationPolicy.ShouldAwaitSlateFocus(
+            searchSession: false,
+            slateDevice: true,
+            focusEnteredTextInput: true));
+        Assert.False(KeyboardInvocationPolicy.ShouldAwaitSlateFocus(
+            searchSession: false,
+            slateDevice: false,
+            focusEnteredTextInput: true));
+        Assert.True(KeyboardInvocationPolicy.ShouldAwaitSlateFocus(
+            searchSession: true,
+            slateDevice: false,
+            focusEnteredTextInput: false));
+        Assert.True(KeyboardInvocationPolicy.ShouldAuthorizeSlateOcclusion(
+            slateDevice: true,
+            hasInputField: true,
+            focusEnteredTextInput: false,
+            pointerOnOfficialSip: true));
+        Assert.True(KeyboardInvocationPolicy.ShouldAuthorizeSlateOcclusion(
+            slateDevice: true,
+            hasInputField: true,
+            focusEnteredTextInput: true,
+            pointerOnOfficialSip: false));
+        Assert.False(KeyboardInvocationPolicy.ShouldAuthorizeSlateOcclusion(
+            slateDevice: true,
+            hasInputField: true,
+            focusEnteredTextInput: false,
+            pointerOnOfficialSip: false));
+        Assert.False(KeyboardInvocationPolicy.ShouldAuthorizeSlateOcclusion(
+            slateDevice: false,
+            hasInputField: true,
+            focusEnteredTextInput: true,
+            pointerOnOfficialSip: true));
+    }
+
+    [Fact]
     public void Global_pointer_hook_runs_only_for_an_active_foreground_t9_profile()
     {
-        Assert.True(PointerIntentTrackingPolicy.ShouldEnable(
+        Assert.False(PointerIntentTrackingPolicy.ShouldEnable(
             canCommitForeground: true,
             hasForegroundProfileLease: false,
             hasObservedActiveProfile: false));
-        Assert.True(PointerIntentTrackingPolicy.ShouldEnable(
+        Assert.False(PointerIntentTrackingPolicy.ShouldEnable(
             canCommitForeground: false,
             hasForegroundProfileLease: true,
             hasObservedActiveProfile: false));
@@ -616,6 +1131,16 @@ public class HostHitMapTests
             canCommitForeground: false,
             hasForegroundProfileLease: false,
             hasObservedActiveProfile: false));
+        Assert.True(PointerIntentTrackingPolicy.ShouldEnableForSession(
+            canCommitForeground: false,
+            hasForegroundProfileLease: false,
+            hasSystemProfileLease: false,
+            officialT9Selected: true));
+        Assert.False(PointerIntentTrackingPolicy.ShouldEnableForSession(
+            canCommitForeground: true,
+            hasForegroundProfileLease: true,
+            hasSystemProfileLease: true,
+            officialT9Selected: false));
     }
 
     [Fact]
@@ -624,6 +1149,25 @@ public class HostHitMapTests
         Assert.True(PointerIntentTrackingPolicy.IsKeyboardWindow("T9Ime.BandHost"));
         Assert.False(PointerIntentTrackingPolicy.IsKeyboardWindow(
             "ApplicationFrameWindow"));
+        Assert.True(PointerIntentTrackingPolicy.IsOverlayContact(
+            keyboardWindow: true,
+            hostPointerLive: false));
+        Assert.True(PointerIntentTrackingPolicy.IsOverlayContact(
+            keyboardWindow: false,
+            hostPointerLive: true));
+        Assert.False(PointerIntentTrackingPolicy.IsOverlayContact(
+            keyboardWindow: false,
+            hostPointerLive: false));
+        Assert.True(PointerIntentTrackingPolicy.IsSipWindow(
+            "HwndWrapper[T9Pane;;1]",
+            windowPid: 42,
+            ourPid: 42));
+        Assert.False(PointerIntentTrackingPolicy.IsSipWindow(
+            "ApplicationFrameWindow",
+            windowPid: 99,
+            ourPid: 42));
+        Assert.Equal(0x15u, TouchInvocationPolicy.PromotedPointerId(0xFF515715));
+        Assert.Equal(0u, TouchInvocationPolicy.PromotedPointerId(0));
     }
 
     [Fact]
@@ -641,6 +1185,9 @@ public class HostHitMapTests
             sameHost: true,
             sameContext: true,
             hostReady: false));
+        Assert.True(HostFrame.ShouldParkLocalWindow(hosting: true, hostReady: true));
+        Assert.False(HostFrame.ShouldParkLocalWindow(hosting: true, hostReady: false));
+        Assert.False(HostFrame.ShouldParkLocalWindow(hosting: false, hostReady: true));
     }
 
     [Fact]
@@ -764,8 +1311,8 @@ public class HostHitMapTests
             hasNativeField: false,
             default));
 
-        // 非系统表面本来就不走这条等待逻辑。
-        Assert.False(InputFieldSelectionPolicy.NeedsAuthoritativeFirstShow(
+        // 桌面 uia/box 同样要等插入点，否则会按外框顶边摆到输入行上。
+        Assert.True(InputFieldSelectionPolicy.NeedsAuthoritativeFirstShow(
             systemTextHost: false,
             hasUiField: true,
             new InputField(surface, caret, default, CaretIsTrusted: false),
@@ -936,6 +1483,36 @@ public class HostHitMapTests
         var degradedSource = "searchbox";
         Assert.True(gate.Apply(surface, taskbarBox, ref degraded, ref degradedSource));
         Assert.Equal(1037, degraded.Top);
+    }
+
+    [Fact]
+    public void Search_text_and_box_on_the_same_chrome_keep_the_insertion_point()
+    {
+        var surface = new IntPtr(0x4321);
+        var gate = new CaretQualityGate();
+        var caret = new NativeRect { Left = 134, Top = 107, Right = 136, Bottom = 131 };
+        var source = "uia/text";
+        Assert.False(gate.Apply(surface, "search/text", ref caret, ref source));
+
+        var box = new NativeRect { Left = 72, Top = 100, Right = 420, Bottom = 148 };
+        var boxSource = "uia/box";
+        Assert.True(gate.Apply(surface, "search/box", ref box, ref boxSource));
+        Assert.Equal(134, box.Left);
+        Assert.Equal(107, box.Top);
+        Assert.Equal("uia/text", boxSource);
+
+        Assert.True(CaretQualityGate.IsSameSearchChrome(
+            sameSurface: true,
+            CaretQualityGate.Rank("uia/text"),
+            CaretQualityGate.Rank("uia/box"),
+            new NativeRect { Left = 134, Top = 107, Right = 136, Bottom = 131 },
+            new NativeRect { Left = 72, Top = 100, Right = 420, Bottom = 148 }));
+        Assert.False(CaretQualityGate.IsSameSearchChrome(
+            sameSurface: true,
+            CaretQualityGate.Rank("uia/text"),
+            CaretQualityGate.Rank("uia/box"),
+            new NativeRect { Left = 111, Top = 87, Right = 113, Bottom = 111 },
+            new NativeRect { Left = 118, Top = 1037, Right = 120, Bottom = 1060 }));
     }
 
     [Fact]

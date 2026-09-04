@@ -13,20 +13,12 @@ internal readonly record struct SipWindowHit(
 
 internal sealed class SipWindowLocator
 {
-    private static readonly HashSet<string> SipProcessNames =
-    [
-        "textinputhost",
-        "tabtip",
-        "tabtip32",
-        "windowsinternal.composableshell.experiences.textinput.inputapp"
-    ];
-
     private bool _dumped;
 
     public IReadOnlyList<(IntPtr Hwnd, NativeRect Rect)> FindKeyboardWindows()
     {
         return Enumerate(includeChildren: true)
-            .Where(x => LooksLikeTouchKeyboard(x.Rect) && !x.Cloaked)
+            .Where(x => LooksLikeSuppressibleSip(x.Rect) && !x.Cloaked)
             .OrderByDescending(ScoreVisual)
             .Select(x => (x.Hwnd, x.Rect))
             .ToList();
@@ -72,9 +64,9 @@ internal sealed class SipWindowLocator
         var hits = Enumerate(includeChildren: true);
         DumpOnce(hits);
 
-        var visual = visualHint is { } hint && !hint.IsEmpty && LooksLikeTouchKeyboard(hint)
+        var visual = visualHint is { } hint && !hint.IsEmpty && LooksLikeSuppressibleSip(hint)
             ? hint
-            : hits.Where(x => !x.Cloaked && LooksLikeTouchKeyboard(x.Rect))
+            : hits.Where(x => !x.Cloaked && LooksLikeSuppressibleSip(x.Rect))
                 .OrderByDescending(ScoreVisual)
                 .Select(x => (NativeRect?)x.Rect)
                 .FirstOrDefault() ?? default;
@@ -87,7 +79,7 @@ internal sealed class SipWindowLocator
 
         var hwnd = PickHost(hits, visual);
         target = (hwnd, visual);
-        return hwnd != IntPtr.Zero || LooksLikeTouchKeyboard(visual);
+        return hwnd != IntPtr.Zero || LooksLikeSuppressibleSip(visual);
     }
 
     public IReadOnlyList<IntPtr> FindWindowsContaining(NativeRect area)
@@ -105,38 +97,21 @@ internal sealed class SipWindowLocator
             .ToList();
     }
 
-    public static bool LooksLikeTouchKeyboard(NativeRect rect)
+    public static bool LooksLikeTouchKeyboard(NativeRect rect) =>
+        TryWork(rect, out var work) && SipSuppressionPolicy.LooksLikeTouchKeyboard(rect, work);
+
+    public static bool LooksLikeSuppressibleSip(NativeRect rect) =>
+        TryWork(rect, out var work) && SipSuppressionPolicy.LooksLikeSuppressibleSip(rect, work);
+
+    private static bool TryWork(NativeRect rect, out NativeRect work)
     {
-        if (rect.IsEmpty || !NativeMethods.TryGetMonitorWork(rect, out var work))
+        if (rect.IsEmpty || !NativeMethods.TryGetMonitorWork(rect, out work))
         {
+            work = default;
             return false;
         }
 
-        var width = rect.Width;
-        var height = rect.Height;
-        if (width < 360 || height < 160)
-        {
-            return false;
-        }
-
-        // TextInputHost 常驻一个接近全屏的宿主窗口，不能拿来当键盘可视区域。
-        if (height > work.Height * 0.50 || width * height > work.Area * 0.55)
-        {
-            return false;
-        }
-
-        var docked = width >= work.Width * 0.55
-                     && height <= work.Height * 0.48
-                     && height >= 180
-                     && Math.Abs(rect.Bottom - work.Bottom) <= 48;
-
-        var floating = width >= 360
-                       && width <= work.Width * 0.92
-                       && height is >= 180 and <= 580
-                       && width >= height * 1.25
-                       && width * height < work.Area * 0.42;
-
-        return docked || floating;
+        return !work.IsEmpty;
     }
 
     private static IntPtr PickHost(IReadOnlyList<SipWindowHit> hits, NativeRect visual)
@@ -215,7 +190,7 @@ internal sealed class SipWindowLocator
         var processPath = NativeMethods.GetProcessPath(pid);
         var name = Path.GetFileNameWithoutExtension(processPath).ToLowerInvariant();
         var className = NativeMethods.GetWindowClass(hwnd);
-        var sipProcess = SipProcessNames.Contains(name) || name.Contains("textinput", StringComparison.Ordinal);
+        var sipProcess = SipSuppressionPolicy.IsOfficialSipProcess(name);
         if (!sipProcess)
         {
             return false;

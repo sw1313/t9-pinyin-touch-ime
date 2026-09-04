@@ -48,7 +48,12 @@ dotnet test src\T9Pane.Tests\T9Pane.Tests.csproj
 pwsh -File tools\Pack-Release.ps1
 ```
 
-把 `dist\T9-Pinyin-Touch-IME-*-Setup.exe` 挂到 GitHub Release。这是 Win32 安装程序，不要把 `dist\` 提交进 git。
+把 `dist\T9-Pinyin-Touch-IME-*-Setup.exe` 挂到 GitHub Release。用本机已登录的 `gh`，不要走 Cursor 自带的 GitHub 连接。这是 Win32 安装程序，不要把 `dist\` 提交进 git。
+
+```powershell
+$ver = (Select-String -LiteralPath src\T9Pane\T9Pane.csproj -Pattern '<Version>([^<]+)</Version>').Matches[0].Groups[1].Value
+gh release create "v$ver" "dist\T9-Pinyin-Touch-IME-$ver-Setup.exe" --repo sw1313/t9-pinyin-touch-ime --title "T9 拼音触屏输入法 $ver"
+```
 
 ## 许可
 

@@ -100,6 +100,34 @@ public class ImeRoutingTests
     }
 
     [Fact]
+    public void Pinned_host_keeps_searchhost_when_explorer_owns_foreground()
+    {
+        var hwnd = new IntPtr(22);
+        var clients = new List<ImeClient>
+        {
+            new()
+            {
+                Pid = 12036,
+                Hwnd = hwnd,
+                ProfileActive = true,
+                ObservationOrder = 10
+            }
+        };
+
+        Assert.True(ImeRouting.TryPickHostClient(
+            clients,
+            unchecked((ulong)hwnd.ToInt64()),
+            out var picked));
+        Assert.Equal(12036u, picked!.Pid);
+
+        clients[0].ProfileActive = false;
+        Assert.False(ImeRouting.TryPickHostClient(
+            clients,
+            unchecked((ulong)hwnd.ToInt64()),
+            out _));
+    }
+
+    [Fact]
     public void Visible_keyboard_command_never_targets_an_unrelated_surface()
     {
         var clients = new List<ImeClient>
@@ -332,6 +360,59 @@ public class ImeRoutingTests
             fromTray: false,
             "cursor",
             toTray: false));
+        Assert.True(ShellProcess.IsSearchSessionSurfaceName(
+            "explorer",
+            trayChrome: false,
+            searchFlyoutVisible: true));
+        Assert.False(ShellProcess.IsSearchSessionSurfaceName(
+            "explorer",
+            trayChrome: false,
+            searchFlyoutVisible: false));
+        Assert.True(ShellProcess.IsSearchHandoffName(
+            "explorer",
+            fromTray: false,
+            "searchhost",
+            toTray: false,
+            searchFlyoutVisible: true));
+        Assert.True(ShellProcess.RequiresHostRenderName(
+            "explorer",
+            systemFlyout: false,
+            trayChrome: false,
+            searchFlyoutVisible: true));
+        Assert.False(ShellProcess.RequiresHostRenderName(
+            "explorer",
+            systemFlyout: false,
+            trayChrome: false,
+            searchFlyoutVisible: false));
+        Assert.True(ShellProcess.RequiresHostRenderName(
+            "searchhost",
+            systemFlyout: true,
+            trayChrome: false,
+            searchFlyoutVisible: true));
+        Assert.Equal(
+            PointerInvocationOrigin.StartMenuSearch,
+            KeyboardInvocationPolicy.OriginForSearchSurface(
+                "searchhost",
+                trayChrome: false,
+                searchFlyoutVisible: true));
+        Assert.Equal(
+            PointerInvocationOrigin.StartMenuSearch,
+            KeyboardInvocationPolicy.OriginForSearchSurface(
+                "explorer",
+                trayChrome: false,
+                searchFlyoutVisible: true));
+        Assert.Equal(
+            PointerInvocationOrigin.TaskbarSearch,
+            KeyboardInvocationPolicy.OriginForSearchSurface(
+                "explorer",
+                trayChrome: true,
+                searchFlyoutVisible: false));
+        Assert.Equal(
+            PointerInvocationOrigin.Unknown,
+            KeyboardInvocationPolicy.OriginForSearchSurface(
+                "cursor",
+                trayChrome: false,
+                searchFlyoutVisible: true));
     }
 
     [Fact]
@@ -559,6 +640,18 @@ public class ImeRoutingTests
             sameForegroundHost: true,
             profileActive: true,
             elapsed: TimeSpan.FromMilliseconds(800)));
+        Assert.True(DesktopContextGracePolicy.ShouldHoldAfterAuthorize(
+            overlayVisible: true,
+            sameForegroundHost: true,
+            sinceAuthorize: TimeSpan.FromMilliseconds(1200)));
+        Assert.False(DesktopContextGracePolicy.ShouldHoldAfterAuthorize(
+            overlayVisible: true,
+            sameForegroundHost: false,
+            sinceAuthorize: TimeSpan.FromMilliseconds(1200)));
+        Assert.False(DesktopContextGracePolicy.ShouldHoldAfterAuthorize(
+            overlayVisible: true,
+            sameForegroundHost: true,
+            sinceAuthorize: TimeSpan.FromMilliseconds(2500)));
     }
 
     [Fact]
@@ -600,6 +693,94 @@ public class ImeRoutingTests
         Assert.True(ImeRouting.HasDocumentLease(client));
         Assert.True(client.NativeCaret.IsEmpty);
         Assert.Equal(viewport, client.NativeScreen);
+    }
+
+    [Fact]
+    public void Layout_pending_keeps_the_last_good_caret()
+    {
+        var client = new ImeClient { Pid = 42, Hwnd = new IntPtr(7) };
+        var caret = new NativeRect { Left = 80, Top = 120, Right = 82, Bottom = 144 };
+        var viewport = new NativeRect { Left = 10, Top = 20, Right = 1010, Bottom = 720 };
+
+        Assert.True(ImeClientState.ApplyContext(
+            client, true, true, true, 5, 2, 1, caret, viewport, IntPtr.Zero));
+        Assert.Equal(caret, client.NativeCaret);
+        Assert.False(client.HasRangeSelection);
+
+        Assert.True(ImeClientState.ApplyContext(
+            client, true, true, true, 6, 2, 2, default, viewport, IntPtr.Zero));
+        Assert.Equal(caret, client.NativeCaret);
+        Assert.Equal(2, client.LayoutState);
+        Assert.True(client.DocumentFocused);
+
+        Assert.True(ImeClientState.ApplyContext(
+            client, false, true, false, 7, 3, 2, default, viewport, IntPtr.Zero));
+        Assert.True(client.NativeCaret.IsEmpty);
+    }
+
+    [Fact]
+    public void Range_selection_is_remembered_on_the_client()
+    {
+        var client = new ImeClient { Pid = 42, Hwnd = new IntPtr(7) };
+        var caret = new NativeRect { Left = 80, Top = 120, Right = 82, Bottom = 144 };
+
+        Assert.True(ImeClientState.ApplyContext(
+            client, true, true, true, 5, 2, 1, caret, default, IntPtr.Zero, hasRangeSelection: true));
+        Assert.True(client.HasRangeSelection);
+        Assert.True(ImeClientState.ApplyContext(
+            client, true, true, true, 6, 2, 1, caret, default, IntPtr.Zero, hasRangeSelection: false));
+        Assert.False(client.HasRangeSelection);
+    }
+
+    [Fact]
+    public void Layout_only_sync_skips_uia_and_visibility()
+    {
+        Assert.True(LayoutSyncPolicy.IsLayoutOnly(1));
+        Assert.True(LayoutSyncPolicy.IsLayoutOnly(2));
+        Assert.False(LayoutSyncPolicy.IsLayoutOnly(0));
+        Assert.False(LayoutSyncPolicy.IsLayoutOnly(1, documentActive: false));
+        Assert.True(LayoutSyncPolicy.IsLayoutOnly(1, rangeSelected: true));
+        Assert.True(LayoutSyncPolicy.ShouldUseLayoutFastPath(
+            overlayVisible: true,
+            authorized: true,
+            rangeSelected: false));
+        Assert.False(LayoutSyncPolicy.ShouldUseLayoutFastPath(
+            overlayVisible: false,
+            authorized: true,
+            rangeSelected: false));
+        Assert.False(LayoutSyncPolicy.ShouldUseLayoutFastPath(
+            overlayVisible: true,
+            authorized: true,
+            rangeSelected: true));
+        Assert.False(LayoutSyncPolicy.ShouldUseLayoutFastPath(
+            overlayVisible: true,
+            authorized: true,
+            rangeSelected: false,
+            focusAway: true));
+        Assert.True(SelectionVisibilityPolicy.ShouldHide(
+            touchSelectionChrome: true,
+            rangeSelected: true));
+        Assert.False(SelectionVisibilityPolicy.ShouldHide(touchSelectionChrome: false));
+        Assert.True(SelectionVisibilityPolicy.ShouldShowForCaret(touchSelectionChrome: false));
+        Assert.False(SelectionVisibilityPolicy.ShouldShowForCaret(
+            touchSelectionChrome: true,
+            rangeSelected: true));
+        Assert.False(LayoutSyncPolicy.ShouldProbeUiAutomation(layoutOnly: true));
+        Assert.True(LayoutSyncPolicy.ShouldProbeUiAutomation(layoutOnly: false));
+        Assert.False(LayoutSyncPolicy.ShouldDecideVisibility(layoutOnly: true));
+        Assert.True(LayoutSyncPolicy.ShouldKeepVisibleWithoutField(
+            overlayVisible: true,
+            authorized: true,
+            rejectedWrongBox: false));
+        Assert.False(LayoutSyncPolicy.ShouldKeepVisibleWithoutField(
+            overlayVisible: true,
+            authorized: true,
+            rejectedWrongBox: true));
+        Assert.False(LayoutSyncPolicy.ShouldKeepVisibleWithoutField(
+            overlayVisible: true,
+            authorized: true,
+            rejectedWrongBox: false,
+            focusAway: true));
     }
 
     [Fact]

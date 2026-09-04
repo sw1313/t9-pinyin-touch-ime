@@ -74,18 +74,22 @@ internal static class ShellProcess
     /// SearchHost：这不是换了应用，不能拆掉刚授的权，否则键盘闪一下就没。
     /// explorer 只有任务栏那一份算在会话里，普通文件窗口不算。
     /// </summary>
-    internal static bool IsSearchSessionSurfaceName(string processName, bool trayChrome) =>
+    internal static bool IsSearchSessionSurfaceName(
+        string processName,
+        bool trayChrome,
+        bool searchFlyoutVisible = false) =>
         Search.Contains(processName)
         || processName == "startmenuexperiencehost"
-        || (processName == "explorer" && trayChrome);
+        || (processName == "explorer" && (trayChrome || searchFlyoutVisible));
 
     internal static bool IsSearchHandoffName(
         string fromName,
         bool fromTray,
         string toName,
-        bool toTray) =>
-        IsSearchSessionSurfaceName(fromName, fromTray)
-        && IsSearchSessionSurfaceName(toName, toTray);
+        bool toTray,
+        bool searchFlyoutVisible = false) =>
+        IsSearchSessionSurfaceName(fromName, fromTray, searchFlyoutVisible)
+        && IsSearchSessionSurfaceName(toName, toTray, searchFlyoutVisible);
 
     internal static bool IsSearchHandoff(IntPtr from, IntPtr to)
     {
@@ -110,7 +114,8 @@ internal static class ShellProcess
             Name(fromRoot),
             IsTrayChrome(fromRoot),
             Name(toRoot),
-            IsTrayChrome(toRoot));
+            IsTrayChrome(toRoot),
+            HasVisibleSearchFlyout());
     }
 
     public static bool IsSystemFlyout(IntPtr hwnd) => SystemFlyouts.Contains(Name(hwnd));
@@ -129,8 +134,35 @@ internal static class ShellProcess
         systemFlyout
         || (processName == "explorer" && trayChrome);
 
+    /// <summary>
+    /// 开始菜单 / SearchHost 浮层还在时，explorer 上的搜索框也必须走宿主位图。
+    /// 官方 SIP 在 IHM 层；WPF 顶层窗会画在菜单上面，点却落到菜单按钮上。
+    /// </summary>
+    internal static bool RequiresHostRenderName(
+        string processName,
+        bool systemFlyout,
+        bool trayChrome,
+        bool searchFlyoutVisible) =>
+        IsSystemTextSurfaceName(processName, systemFlyout, trayChrome)
+        || (processName == "explorer" && searchFlyoutVisible);
+
     public static bool RequiresHostRender(IntPtr hwnd) =>
-        IsSystemTextSurface(hwnd);
+        RequiresHostRenderName(
+            Name(hwnd),
+            IsSystemFlyout(hwnd) || IsSearch(hwnd),
+            IsTrayChrome(hwnd),
+            HasVisibleSearchFlyout());
+
+    public static bool HasVisibleSearchFlyout() =>
+        TryFindVisibleSearch(out _, out _) || TryFindVisibleStartMenu(out _, out _);
+
+    public static bool IsActiveSearchSession(IntPtr hwnd, bool hasTaskbarSearch = false) =>
+        hasTaskbarSearch
+        || (hwnd != IntPtr.Zero
+            && IsSearchSessionSurfaceName(
+                Name(hwnd),
+                IsTrayChrome(hwnd),
+                HasVisibleSearchFlyout()));
 
     public static bool IsForegroundFlyout()
     {
@@ -144,7 +176,7 @@ internal static class ShellProcess
         return IsSystemFlyout(top)
             || IsSearch(top)
             || IsSystemFlyout(fg)
-            || (Name(top) == "explorer" && TryFindVisibleSearch(out _, out _));
+            || (Name(top) == "explorer" && HasVisibleSearchFlyout());
     }
 
     public static bool IsForegroundSystemTextHost()
@@ -280,6 +312,41 @@ internal static class ShellProcess
             }
 
             if (!NativeMethods.GetWindowRect(h, out var r) || r.Width < 200 || r.Height < 60)
+            {
+                return true;
+            }
+
+            found = h;
+            foundRect = r;
+            return false;
+        }, IntPtr.Zero);
+
+        if (found == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        hwnd = found;
+        rect = foundRect;
+        return true;
+    }
+
+    public static bool TryFindVisibleStartMenu(out IntPtr hwnd, out NativeRect rect)
+    {
+        hwnd = IntPtr.Zero;
+        rect = default;
+        IntPtr found = IntPtr.Zero;
+        NativeRect foundRect = default;
+        NativeMethods.EnumWindows((h, _) =>
+        {
+            if (!NativeMethods.IsWindowVisible(h)
+                || NativeMethods.IsCloaked(h)
+                || Name(h) != "startmenuexperiencehost")
+            {
+                return true;
+            }
+
+            if (!NativeMethods.GetWindowRect(h, out var r) || r.Width < 200 || r.Height < 200)
             {
                 return true;
             }

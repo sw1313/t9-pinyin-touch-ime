@@ -1,8 +1,11 @@
 #include "T9Ime.h"
 #include "Guids.h"
+#include "SipCancel.h"
+#include "TsfFunctions.h"
 #include <msctf.h>
 #include <oleauto.h>
 #include <sddl.h>
+#include <climits>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -11,9 +14,42 @@
 
 extern HINSTANCE g_hInst;
 
+#ifndef WM_TABLET_QUERYSYSTEMGESTURESTATUS
+#define WM_TABLET_DEFBASE 0x02C0
+#define WM_TABLET_QUERYSYSTEMGESTURESTATUS (WM_TABLET_DEFBASE + 12)
+#endif
+#ifndef TABLET_DISABLE_PRESSANDHOLD
+#define TABLET_DISABLE_PRESSANDHOLD 0x00000001
+#define TABLET_DISABLE_PENTAPFEEDBACK 0x00000008
+#define TABLET_DISABLE_PENBARRELFEEDBACK 0x00000010
+#define TABLET_DISABLE_FLICKS 0x00010000
+#endif
+
 namespace
 {
     const UINT WmT9Apply = WM_APP + 21;
+
+    void DisablePressAndHold(HWND hwnd)
+    {
+        if (!hwnd)
+        {
+            return;
+        }
+
+        GESTURECONFIG config = {};
+        config.dwID = 0;
+        config.dwWant = 0;
+        config.dwBlock = GC_ALLGESTURES;
+        SetGestureConfig(hwnd, 0, 1, &config, sizeof(config));
+        SetPropW(
+            hwnd,
+            L"MicrosoftTabletPenServiceProperty",
+            reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(
+                TABLET_DISABLE_PRESSANDHOLD |
+                TABLET_DISABLE_PENTAPFEEDBACK |
+                TABLET_DISABLE_PENBARRELFEEDBACK |
+                TABLET_DISABLE_FLICKS)));
+    }
 
     // SampleIME _IsKeyEaten：不组合就不拦截。T9 用屏幕键盘上屏，
     // 实体键必须原样交给应用，否则回车/Ctrl+Space 切输入法都会被吞掉。
@@ -322,8 +358,8 @@ namespace
 class T9Ime::ContextProbeSession : public ITfEditSession
 {
 public:
-    ContextProbeSession(ITfContext* context, T9Ime* ime, LONG epoch)
-        : _ref(1), _context(context), _ime(ime), _epoch(epoch)
+    ContextProbeSession(ITfContext* context, T9Ime* ime, LONG epoch, int source)
+        : _ref(1), _context(context), _ime(ime), _epoch(epoch), _source(source)
     {
         if (_context)
         {
@@ -406,6 +442,12 @@ public:
                 && fetched > 0
                 && selection.range)
             {
+                BOOL emptyRange = TRUE;
+                if (SUCCEEDED(selection.range->IsEmpty(ec, &emptyRange)))
+                {
+                    geometry.HasRangeSelection = emptyRange == FALSE;
+                }
+
                 ITfRange* caret = nullptr;
                 if (SUCCEEDED(selection.range->Clone(&caret)) && caret)
                 {
@@ -436,7 +478,7 @@ public:
             view->Release();
         }
 
-        _ime->CompleteContextProbe(_context, _epoch, geometry);
+        _ime->CompleteContextProbe(_context, _epoch, geometry, _source);
         return S_OK;
     }
 
@@ -445,6 +487,7 @@ private:
     ITfContext* _context;
     T9Ime* _ime;
     LONG _epoch;
+    int _source;
 };
 
 T9Ime::T9Ime()
@@ -461,9 +504,11 @@ T9Ime::T9Ime()
       _bandChild(false), _bandVisible(false),
       _bandPointerDown({ 0, 0 }), _bandPointerActive(false),
       _bandDragging(false), _bandDragCursor({ 0, 0 }), _bandDragWindow({ 0, 0 }),
-      _bandFrameWidth(0), _bandFrameHeight(0), _bandPointerId(0),
+      _bandFrameWidth(0), _bandFrameHeight(0), _bandX(INT_MIN), _bandY(INT_MIN),
+      _bandPointerId(0),
       _composition(nullptr), _lastComposeLen(0),
-      _cmdStop(nullptr), _cmdThread(nullptr), _cmdClient(nullptr)
+      _cmdStop(nullptr), _cmdThread(nullptr), _cmdClient(nullptr),
+      _searchCandidates(nullptr), _functionProviderAdvised(false)
 {
 }
 
@@ -511,6 +556,14 @@ STDMETHODIMP T9Ime::QueryInterface(REFIID riid, void** ppv)
     {
         *ppv = static_cast<ITfCompositionSink*>(this);
     }
+    else if (riid == IID_ITfFunctionProvider)
+    {
+        *ppv = static_cast<ITfFunctionProvider*>(this);
+    }
+    else if (riid == IID_ITfFunction || riid == IID_ITfFnGetPreferredTouchKeyboardLayout)
+    {
+        *ppv = static_cast<ITfFnGetPreferredTouchKeyboardLayout*>(this);
+    }
     else
     {
         *ppv = nullptr;
@@ -537,7 +590,7 @@ STDMETHODIMP T9Ime::Activate(ITfThreadMgr* ptim, TfClientId tid)
     return ActivateEx(ptim, tid, 0);
 }
 
-STDMETHODIMP T9Ime::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD)
+STDMETHODIMP T9Ime::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD dwFlags)
 {
     if (!ptim)
     {
@@ -547,16 +600,17 @@ STDMETHODIMP T9Ime::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD)
     _threadMgr = ptim;
     _threadMgr->AddRef();
     _clientId = tid;
-    DWORD activeFlags = 0;
+    DWORD activeFlags = dwFlags;
     ITfThreadMgrEx* threadManagerEx = nullptr;
     if (SUCCEEDED(_threadMgr->QueryInterface(
             IID_ITfThreadMgrEx,
             reinterpret_cast<void**>(&threadManagerEx)))
         && threadManagerEx)
     {
-        if (FAILED(threadManagerEx->GetActiveFlags(&activeFlags)))
+        DWORD liveFlags = 0;
+        if (SUCCEEDED(threadManagerEx->GetActiveFlags(&liveFlags)) && liveFlags != 0)
         {
-            activeFlags = 0;
+            activeFlags = liveFlags;
         }
         threadManagerEx->Release();
     }
@@ -594,12 +648,15 @@ STDMETHODIMP T9Ime::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD)
     // Chromium/Cursor 在组合态也会把回车交给 TIP；旧 DLL 更会直接吞掉 VK_RETURN。
     EnsureMessageWindow();
     StartCmdPipe();
+    AdviseFunctionProvider();
+    const auto sipCancel = SipCancel::Enable();
 
     const auto sequence = InterlockedIncrement(&_stateSequence);
-    char json[384] = {};
+    char json[416] = {};
     sprintf_s(json,
         "{\"t\":\"on\",\"hwnd\":%llu,\"pid\":%u,\"doc\":%u,\"thread\":%u,"
-        "\"activeFlags\":%lu,\"immersive\":%u,\"uiElementOnly\":%u,\"seq\":%ld}",
+        "\"activeFlags\":%lu,\"immersive\":%u,\"uiElementOnly\":%u,"
+        "\"sipCancel\":%u,\"seq\":%ld}",
         static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(_msgHwnd)),
         GetCurrentProcessId(),
         InterlockedCompareExchange(&_documentFocused, 0, 0) ? 1u : 0u,
@@ -607,6 +664,7 @@ STDMETHODIMP T9Ime::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD)
         static_cast<unsigned long>(activeFlags),
         (activeFlags & TF_TMF_IMMERSIVEMODE) ? 1u : 0u,
         (activeFlags & TF_TMF_UIELEMENTENABLEDONLY) ? 1u : 0u,
+        sipCancel ? 1u : 0u,
         sequence);
     NotifyBackend(json);
     PublishContextState(_activeContext);
@@ -616,6 +674,7 @@ STDMETHODIMP T9Ime::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD)
 STDMETHODIMP T9Ime::Deactivate()
 {
     InterlockedExchange(&_profileActive, 0);
+    SipCancel::Disable();
     StopCmdPipe();
 
     const auto sequence = InterlockedIncrement(&_stateSequence);
@@ -628,6 +687,7 @@ STDMETHODIMP T9Ime::Deactivate()
 
     UnbindFocusedContext();
     InterlockedIncrement(&_contextEpoch);
+    UnadviseFunctionProvider();
 
     if (_threadMgr)
     {
@@ -671,6 +731,8 @@ STDMETHODIMP T9Ime::Deactivate()
         _bandOwner = nullptr;
         _bandHostBand = 0;
         _bandVisible = false;
+        _bandX = INT_MIN;
+        _bandY = INT_MIN;
     }
     if (_bandBitmap)
     {
@@ -690,6 +752,131 @@ STDMETHODIMP T9Ime::Deactivate()
     InterlockedExchange(&_documentFocused, 0);
     InterlockedExchange(&_foregroundFocused, 0);
     InterlockedExchange(&_activeFlags, 0);
+    return S_OK;
+}
+
+void T9Ime::AdviseFunctionProvider()
+{
+    if (!_threadMgr || _functionProviderAdvised)
+    {
+        return;
+    }
+
+    ITfSourceSingle* source = nullptr;
+    if (SUCCEEDED(_threadMgr->QueryInterface(
+            IID_ITfSourceSingle,
+            reinterpret_cast<void**>(&source)))
+        && source)
+    {
+        if (SUCCEEDED(source->AdviseSingleSink(
+                _clientId,
+                IID_ITfFunctionProvider,
+                static_cast<ITfFunctionProvider*>(this))))
+        {
+            _functionProviderAdvised = true;
+        }
+        source->Release();
+    }
+
+    if (!_searchCandidates)
+    {
+        CreateSearchCandidateProvider(&_searchCandidates);
+    }
+}
+
+void T9Ime::UnadviseFunctionProvider()
+{
+    if (_threadMgr && _functionProviderAdvised)
+    {
+        ITfSourceSingle* source = nullptr;
+        if (SUCCEEDED(_threadMgr->QueryInterface(
+                IID_ITfSourceSingle,
+                reinterpret_cast<void**>(&source)))
+            && source)
+        {
+            source->UnadviseSingleSink(_clientId, IID_ITfFunctionProvider);
+            source->Release();
+        }
+    }
+
+    _functionProviderAdvised = false;
+    if (_searchCandidates)
+    {
+        _searchCandidates->Release();
+        _searchCandidates = nullptr;
+    }
+}
+
+STDMETHODIMP T9Ime::GetType(GUID* pguid)
+{
+    if (!pguid)
+    {
+        return E_INVALIDARG;
+    }
+
+    *pguid = CLSID_T9Ime;
+    return S_OK;
+}
+
+STDMETHODIMP T9Ime::GetDescription(BSTR* pbstrDesc)
+{
+    if (!pbstrDesc)
+    {
+        return E_INVALIDARG;
+    }
+
+    *pbstrDesc = SysAllocString(T9IME_DESC);
+    return *pbstrDesc ? S_OK : E_OUTOFMEMORY;
+}
+
+STDMETHODIMP T9Ime::GetFunction(REFGUID rguid, REFIID riid, IUnknown** ppunk)
+{
+    if (!ppunk)
+    {
+        return E_INVALIDARG;
+    }
+
+    *ppunk = nullptr;
+    if (!IsEqualGUID(rguid, GUID_NULL))
+    {
+        return E_NOINTERFACE;
+    }
+
+    if (IsEqualIID(riid, IID_ITfFnSearchCandidateProvider) && _searchCandidates)
+    {
+        NotifyBackend("{\"t\":\"fn\",\"name\":\"searchCandidates\"}");
+        return _searchCandidates->QueryInterface(riid, reinterpret_cast<void**>(ppunk));
+    }
+
+    if (IsEqualIID(riid, IID_ITfFnGetPreferredTouchKeyboardLayout)
+        || IsEqualIID(riid, IID_ITfFunction))
+    {
+        NotifyBackend("{\"t\":\"fn\",\"name\":\"touchLayout\"}");
+    }
+
+    return QueryInterface(riid, reinterpret_cast<void**>(ppunk));
+}
+
+STDMETHODIMP T9Ime::GetDisplayName(BSTR* pbstrName)
+{
+    if (!pbstrName)
+    {
+        return E_INVALIDARG;
+    }
+
+    *pbstrName = SysAllocString(T9IME_DESC);
+    return *pbstrName ? S_OK : E_OUTOFMEMORY;
+}
+
+STDMETHODIMP T9Ime::GetLayout(TKBLayoutType* ptkblayoutType, WORD* pwPreferredLayoutId)
+{
+    if (!ptkblayoutType || !pwPreferredLayoutId)
+    {
+        return E_INVALIDARG;
+    }
+
+    *ptkblayoutType = TKBLT_OPTIMIZED;
+    *pwPreferredLayoutId = TKBL_OPT_SIMPLIFIED_CHINESE_PINYIN;
     return S_OK;
 }
 
@@ -804,6 +991,10 @@ void T9Ime::BindActiveView()
     _activeViewWindow = _activeView
         ? ResolveViewWindow(_activeView)
         : nullptr;
+    if (InterlockedCompareExchange(&_profileActive, 0, 0) && _activeViewWindow)
+    {
+        SipCancel::BindHost(_activeViewWindow);
+    }
     if (!_activeView)
     {
         return;
@@ -863,7 +1054,7 @@ void T9Ime::BindFocusedContext(ITfDocumentMgr* document)
     BindActiveView();
 }
 
-void T9Ime::PublishContextState(ITfContext* context, TfEditCookie readCookie)
+void T9Ime::PublishContextState(ITfContext* context, TfEditCookie readCookie, int source)
 {
     const auto active = context
         && context == _activeContext
@@ -875,15 +1066,15 @@ void T9Ime::PublishContextState(ITfContext* context, TfEditCookie readCookie)
     const auto epoch = InterlockedCompareExchange(&_contextEpoch, 0, 0);
     if (!active)
     {
-        EmitContextState(false, epoch, geometry);
+        EmitContextState(false, epoch, geometry, source);
         return;
     }
 
     BindActiveView();
-    auto* probe = new (std::nothrow) ContextProbeSession(context, this, epoch);
+    auto* probe = new (std::nothrow) ContextProbeSession(context, this, epoch, source);
     if (!probe)
     {
-        CompleteContextProbe(context, epoch, geometry);
+        CompleteContextProbe(context, epoch, geometry, source);
         return;
     }
 
@@ -903,14 +1094,15 @@ void T9Ime::PublishContextState(ITfContext* context, TfEditCookie readCookie)
     probe->Release();
     if (FAILED(requestResult) || FAILED(sessionResult))
     {
-        CompleteContextProbe(context, epoch, geometry);
+        CompleteContextProbe(context, epoch, geometry, source);
     }
 }
 
 void T9Ime::CompleteContextProbe(
     ITfContext* context,
     LONG epoch,
-    const ContextGeometry& geometry)
+    const ContextGeometry& geometry,
+    int source)
 {
     if (!context
         || context != _activeContext
@@ -922,6 +1114,10 @@ void T9Ime::CompleteContextProbe(
     if (geometry.ViewWindow)
     {
         _activeViewWindow = geometry.ViewWindow;
+        if (InterlockedCompareExchange(&_profileActive, 0, 0))
+        {
+            SipCancel::BindHost(_activeViewWindow);
+        }
     }
     const auto active = IsEditableContext(context)
         && InterlockedCompareExchange(&_profileActive, 0, 0) != 0;
@@ -935,17 +1131,18 @@ void T9Ime::CompleteContextProbe(
     if (!active)
     {
         ContextGeometry empty = {};
-        EmitContextState(false, epoch, empty);
+        EmitContextState(false, epoch, empty, source);
         return;
     }
 
-    EmitContextState(true, epoch, geometry);
+    EmitContextState(true, epoch, geometry, source);
 }
 
 void T9Ime::EmitContextState(
     bool active,
     LONG epoch,
-    const ContextGeometry& geometry)
+    const ContextGeometry& geometry,
+    int source)
 {
     const auto activeFlags = static_cast<DWORD>(
         InterlockedCompareExchange(&_activeFlags, 0, 0));
@@ -955,12 +1152,12 @@ void T9Ime::EmitContextState(
     // 本消息之外的状态，所以“内容重复”的通知实际是驱动后端重新评估的心跳，
     // 吞掉它们会让第一次点击弹不出来、失焦也不隐藏。
     const auto sequence = InterlockedIncrement(&_stateSequence);
-    char json[640] = {};
+    char json[704] = {};
     sprintf_s(
         json,
         "{\"t\":\"context\",\"on\":%u,\"profile\":%u,\"thread\":%u,"
         "\"activeFlags\":%lu,\"immersive\":%u,\"uiElementOnly\":%u,"
-        "\"epoch\":%ld,\"layout\":%u,\"x\":%ld,\"y\":%ld,\"r\":%ld,\"b\":%ld,"
+        "\"epoch\":%ld,\"layout\":%u,\"src\":%d,\"sel\":%u,\"x\":%ld,\"y\":%ld,\"r\":%ld,\"b\":%ld,"
         "\"sx\":%ld,\"sy\":%ld,\"sr\":%ld,\"sb\":%ld,\"view\":%llu,"
         "\"hwnd\":%llu,\"pid\":%u,\"seq\":%ld}",
         active ? 1u : 0u,
@@ -971,6 +1168,8 @@ void T9Ime::EmitContextState(
         (activeFlags & TF_TMF_UIELEMENTENABLEDONLY) ? 1u : 0u,
         epoch,
         geometry.HasCaret ? 1u : geometry.LayoutPending ? 2u : 0u,
+        source,
+        geometry.HasRangeSelection ? 1u : 0u,
         geometry.Caret.left,
         geometry.Caret.top,
         geometry.Caret.right,
@@ -1056,7 +1255,7 @@ STDMETHODIMP T9Ime::OnEndEdit(
 {
     if (context == _activeContext)
     {
-        PublishContextState(context, readCookie);
+        PublishContextState(context, readCookie, 2);
     }
     return S_OK;
 }
@@ -1077,7 +1276,7 @@ STDMETHODIMP T9Ime::OnLayoutChange(
     }
     else
     {
-        PublishContextState(context);
+        PublishContextState(context, TF_INVALID_EDIT_COOKIE, 1);
     }
     return S_OK;
 }
@@ -1097,6 +1296,11 @@ void T9Ime::PublishThreadState(bool focused)
 
 STDMETHODIMP T9Ime::OnSetThreadFocus()
 {
+    if (InterlockedCompareExchange(&_profileActive, 0, 0))
+    {
+        // CoreInputView 绑定的是取用那一刻的前台窗口，本线程重新拿到焦点就得重订。
+        SipCancel::Refresh();
+    }
     PublishThreadState(true);
     RefreshDocumentState();
     return S_OK;
@@ -1143,8 +1347,13 @@ STDMETHODIMP T9Ime::OnActivated(
     {
         InterlockedIncrement(&_contextEpoch);
     }
-    if (!t9)
+    if (t9)
     {
+        SipCancel::Refresh();
+    }
+    else
+    {
+        SipCancel::Disable();
         HideBandHost();
     }
     const auto sequence = InterlockedIncrement(&_stateSequence);
@@ -1221,6 +1430,21 @@ void T9Ime::ApplyText(const wchar_t* text, int kind)
     {
         PostReturnKey();
         return;
+    }
+
+    if (kind == T9KindSearchCandidates)
+    {
+        SetSearchCandidateCache(text);
+        return;
+    }
+
+    if (kind == T9KindCompose)
+    {
+        text = ComposeTextFromPayload(text);
+    }
+    else if (kind == T9KindCommit || kind == T9KindCancel)
+    {
+        ClearSearchCandidateCache();
     }
 
     const auto result = RequestInsert(text, kind);
@@ -1382,8 +1606,36 @@ DWORD T9Ime::FindHostBand()
     return best > 1 ? best : 13;
 }
 
+POINT T9Ime::MapBandPointer(HWND hwnd, POINT client) const
+{
+    RECT rc = {};
+    if (!GetClientRect(hwnd, &rc)
+        || rc.right <= 0
+        || rc.bottom <= 0
+        || _bandFrameWidth <= 0
+        || _bandFrameHeight <= 0
+        || (rc.right == _bandFrameWidth && rc.bottom == _bandFrameHeight))
+    {
+        return client;
+    }
+
+    POINT mapped = {
+        MulDiv(client.x, _bandFrameWidth, rc.right),
+        MulDiv(client.y, _bandFrameHeight, rc.bottom)
+    };
+    return mapped;
+}
+
 LRESULT CALLBACK T9Ime::BandProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (msg == WM_TABLET_QUERYSYSTEMGESTURESTATUS)
+    {
+        return TABLET_DISABLE_PRESSANDHOLD |
+            TABLET_DISABLE_PENTAPFEEDBACK |
+            TABLET_DISABLE_PENBARRELFEEDBACK |
+            TABLET_DISABLE_FLICKS;
+    }
+
     if (msg == WM_NCHITTEST)
     {
         return HTCLIENT;
@@ -1438,6 +1690,7 @@ LRESULT CALLBACK T9Ime::BandProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         {
             auto client = info.ptPixelLocation;
             ScreenToClient(hwnd, &client);
+            client = self->MapBandPointer(hwnd, client);
             self->_bandPointerDown = client;
             self->_bandPointerActive = true;
             self->_bandPointerId = pointerId;
@@ -1507,6 +1760,7 @@ LRESULT CALLBACK T9Ime::BandProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         auto client = info.ptPixelLocation;
         ScreenToClient(hwnd, &client);
+        client = self->MapBandPointer(hwnd, client);
         char json[160] = {};
         if (self->_bandDragging)
         {
@@ -1543,16 +1797,25 @@ LRESULT CALLBACK T9Ime::BandProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     if (self && msg == WM_POINTERCAPTURECHANGED)
     {
+        const auto wasActive = self->_bandPointerActive && !self->_bandDragging;
         self->_bandDragging = false;
         self->_bandPointerActive = false;
         self->_bandPointerId = 0;
+        if (wasActive)
+        {
+            self->NotifyBackend("{\"t\":\"release\"}");
+        }
         return 0;
     }
 
     if (self && msg == WM_LBUTTONDOWN)
     {
-        self->_bandPointerDown.x = static_cast<short>(LOWORD(lParam));
-        self->_bandPointerDown.y = static_cast<short>(HIWORD(lParam));
+        POINT down = {
+            static_cast<short>(LOWORD(lParam)),
+            static_cast<short>(HIWORD(lParam))
+        };
+        down = self->MapBandPointer(hwnd, down);
+        self->_bandPointerDown = down;
         self->_bandPointerActive = true;
         self->_bandDragging =
             self->_bandFrameWidth > 0 &&
@@ -1613,8 +1876,13 @@ LRESULT CALLBACK T9Ime::BandProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         {
             ReleaseCapture();
         }
-        const int x = static_cast<short>(LOWORD(lParam));
-        const int y = static_cast<short>(HIWORD(lParam));
+        POINT up = {
+            static_cast<short>(LOWORD(lParam)),
+            static_cast<short>(HIWORD(lParam))
+        };
+        up = self->MapBandPointer(hwnd, up);
+        const int x = up.x;
+        const int y = up.y;
         if (self->_bandDragging)
         {
             RECT rect = {};
@@ -1670,6 +1938,10 @@ bool T9Ime::EnsureBandHost()
         DestroyWindow(_bandHost);
         _bandHost = nullptr;
         _bandVisible = false;
+        _bandX = INT_MIN;
+        _bandY = INT_MIN;
+        _bandFrameWidth = 0;
+        _bandFrameHeight = 0;
     }
 
     WNDCLASSEXW wc = { sizeof(wc) };
@@ -1728,6 +2000,7 @@ bool T9Ime::EnsureBandHost()
     _bandOwner = owner;
     _bandChild = useChild;
     SetWindowLongPtrW(_bandHost, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    DisablePressAndHold(_bandHost);
     return true;
 }
 
@@ -1741,6 +2014,8 @@ void T9Ime::HideBandHost()
     if (wasVisible)
     {
         _bandVisible = false;
+        _bandX = INT_MIN;
+        _bandY = INT_MIN;
         NotifyWinEvent(
             EVENT_OBJECT_IME_HIDE,
             _bandHost,
@@ -1805,22 +2080,36 @@ bool T9Ime::BlitFrame(int x, int y, int width, int height, const BYTE* pixels)
     blend.BlendOp = AC_SRC_OVER;
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
+    // 位置没变时不要带 pptDst，避免分层窗微抖。
+    // psize 必须每次都传：Win11 在 psize=NULL 时会成功返回却不换像素，
+    // 搜索里的 HostRender 就会停在第一张静止图上，按键缩放和候选都看不见。
+    const auto moved = _bandX != dst.x || _bandY != dst.y
+        || _bandFrameWidth != width || _bandFrameHeight != height;
     const auto updated = UpdateLayeredWindow(
         _bandHost,
         screen,
-        &dst,
+        moved ? &dst : nullptr,
         &size,
         mem,
         &source,
         0,
         &blend,
         ULW_ALPHA);
+    if (updated)
+    {
+        _bandX = dst.x;
+        _bandY = dst.y;
+        _bandFrameWidth = width;
+        _bandFrameHeight = height;
+    }
     SelectObject(mem, oldBitmap);
     if (_bandBitmap)
     {
         DeleteObject(_bandBitmap);
     }
     _bandBitmap = bmp;
+    // 分层位图可以比 HWND 大：底下的键看得见，点击却穿到搜索联想上。
+    // 触摸层必须跟帧一样高，位置未变时才钉住，避免每次刷新微抖。
     const auto raised = updated && SetWindowPos(
         _bandHost,
         _bandChild ? HWND_TOP : HWND_TOPMOST,
@@ -1828,7 +2117,7 @@ bool T9Ime::BlitFrame(int x, int y, int width, int height, const BYTE* pixels)
         dst.y,
         width,
         height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | (moved ? 0u : SWP_NOMOVE));
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
     return raised == TRUE;
@@ -1865,9 +2154,6 @@ void T9Ime::HandleFrame(const void* data, int bytes)
     {
         return;
     }
-
-    _bandFrameWidth = w;
-    _bandFrameHeight = h;
 
     const auto wasVisible = _bandVisible;
     if (BlitFrame(x, y, w, h, static_cast<const BYTE*>(data) + 16))
@@ -2233,12 +2519,11 @@ namespace
             nullptr);
     }
 
-    DWORD WINAPI NotifyWorker(PVOID param)
+    void SendNotify(const char* json)
     {
-        auto* json = static_cast<char*>(param);
         HANDLE pipe = INVALID_HANDLE_VALUE;
         DWORD backoff = 1;
-        for (int attempt = 0; attempt < 12 && pipe == INVALID_HANDLE_VALUE; ++attempt)
+        for (int attempt = 0; attempt < 20 && pipe == INVALID_HANDLE_VALUE; ++attempt)
         {
             const wchar_t* pipeNames[] = { T9IME_PIPE_LOCAL, T9IME_PIPE };
             for (const auto* pipeName : pipeNames)
@@ -2255,7 +2540,17 @@ namespace
                 break;
             }
 
-            if (attempt == 0)
+            // 后端为了保序一次只挂一个监听实例，上一条刚读完、新实例还没挂起时
+            // 会短暂连不上，而这段空窗只有几十微秒。先让出时间片快速重试：
+            // Sleep(1) 实际要睡满一个调度周期（约 15ms），连打时每条通知都赔上
+            // 这么久，就成了肉眼可见的延迟。
+            if (attempt < 8)
+            {
+                SwitchToThread();
+                continue;
+            }
+
+            if (attempt == 8)
             {
                 LaunchBackend();
             }
@@ -2269,21 +2564,110 @@ namespace
 
         if (pipe == INVALID_HANDLE_VALUE)
         {
-            delete[] json;
-            return 0;
+            return;
         }
 
         DWORD written = 0;
         WriteFile(pipe, json, static_cast<DWORD>(strlen(json)), &written, nullptr);
         CloseHandle(pipe);
-        delete[] json;
-        return 0;
+    }
+
+    // 按下 / 抬起必须按产生顺序送达。
+    //
+    // 原先每条通知各起一个线程池任务，而后端为了保序一次只挂一个管道实例，
+    // 于是这些任务互相抢连接、抢不到的退避重试，送达顺序最终由线程调度决定：
+    // 抬起可能跑到按下前面。后端的按下闸门只有一个 bool，乱序就会把该执行的
+    // 抬起当成该丢弃的，表现为快速连打吞字、按下动画不出现。
+    //
+    // 改成单线程按队列串行发送，顺序回到产生顺序，也不再自己跟自己抢管道。
+    struct NotifyNode
+    {
+        char* json;
+        NotifyNode* next;
+    };
+
+    CRITICAL_SECTION g_notifyGate;
+    HANDLE g_notifySignal = nullptr;
+    NotifyNode* g_notifyHead = nullptr;
+    NotifyNode* g_notifyTail = nullptr;
+    int g_notifyDepth = 0;
+    INIT_ONCE g_notifyOnce = INIT_ONCE_STATIC_INIT;
+
+    // 后端卡死时不能无限堆积；正常连打的积压远到不了这个深度。
+    const int kNotifyMaxDepth = 512;
+
+    DWORD WINAPI NotifyPump(PVOID)
+    {
+        for (;;)
+        {
+            WaitForSingleObject(g_notifySignal, INFINITE);
+            for (;;)
+            {
+                EnterCriticalSection(&g_notifyGate);
+                auto* node = g_notifyHead;
+                if (node)
+                {
+                    g_notifyHead = node->next;
+                    if (!g_notifyHead)
+                    {
+                        g_notifyTail = nullptr;
+                    }
+                    --g_notifyDepth;
+                }
+                LeaveCriticalSection(&g_notifyGate);
+
+                if (!node)
+                {
+                    break;
+                }
+
+                SendNotify(node->json);
+                delete[] node->json;
+                delete node;
+            }
+        }
+    }
+
+    BOOL CALLBACK StartNotifyPump(PINIT_ONCE, PVOID, PVOID*)
+    {
+        InitializeCriticalSection(&g_notifyGate);
+        g_notifySignal = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_notifySignal)
+        {
+            DeleteCriticalSection(&g_notifyGate);
+            return FALSE;
+        }
+
+        // 泵线程活到进程结束，所以把模块钉住，
+        // 免得 DLL 先被卸载、线程再回到已经释放的代码上。
+        HMODULE self = nullptr;
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&StartNotifyPump),
+            &self);
+
+        auto* thread = CreateThread(nullptr, 0, NotifyPump, nullptr, 0, nullptr);
+        if (!thread)
+        {
+            CloseHandle(g_notifySignal);
+            g_notifySignal = nullptr;
+            DeleteCriticalSection(&g_notifyGate);
+            return FALSE;
+        }
+
+        CloseHandle(thread);
+        return TRUE;
     }
 }
 
 void T9Ime::NotifyBackend(const char* json)
 {
     if (!json)
+    {
+        return;
+    }
+
+    if (!InitOnceExecuteOnce(&g_notifyOnce, StartNotifyPump, nullptr, nullptr))
     {
         return;
     }
@@ -2296,10 +2680,39 @@ void T9Ime::NotifyBackend(const char* json)
     }
 
     memcpy(copy, json, len + 1);
-    if (!QueueUserWorkItem(NotifyWorker, copy, WT_EXECUTEDEFAULT))
+    auto* node = new (std::nothrow) NotifyNode{ copy, nullptr };
+    if (!node)
     {
         delete[] copy;
+        return;
     }
+
+    EnterCriticalSection(&g_notifyGate);
+    const bool overflow = g_notifyDepth >= kNotifyMaxDepth;
+    if (!overflow)
+    {
+        if (g_notifyTail)
+        {
+            g_notifyTail->next = node;
+        }
+        else
+        {
+            g_notifyHead = node;
+        }
+
+        g_notifyTail = node;
+        ++g_notifyDepth;
+    }
+    LeaveCriticalSection(&g_notifyGate);
+
+    if (overflow)
+    {
+        delete[] copy;
+        delete node;
+        return;
+    }
+
+    SetEvent(g_notifySignal);
 }
 
 bool T9Ime::EnsureBackend()

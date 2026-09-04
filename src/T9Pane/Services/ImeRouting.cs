@@ -184,6 +184,33 @@ internal static class StateSequencePolicy
         incoming == 0 || incoming > current;
 }
 
+/// <summary>
+/// 官方 GetTextExt 在手柄弹出、选区动画时会返回 TS_E_NOLAYOUT（layoutState=2）。
+/// 那只表示这一拍还没排完版，不是“输入框没了”。清掉上次光标会让键盘弹不出或被藏。
+/// </summary>
+internal static class NativeCaretPolicy
+{
+    public static Native.NativeRect Apply(
+        Native.NativeRect current,
+        Native.NativeRect incoming,
+        int layoutState,
+        bool documentActive,
+        bool epochAdvanced)
+    {
+        if (!documentActive)
+        {
+            return default;
+        }
+
+        if (epochAdvanced)
+        {
+            return layoutState == 1 ? incoming : default;
+        }
+
+        return layoutState == 1 ? incoming : current;
+    }
+}
+
 internal static class ImeClientState
 {
     public static bool ApplyDocumentFocus(ImeClient client, bool focused, uint sequence)
@@ -301,7 +328,8 @@ internal static class ImeClientState
         int layoutState,
         Native.NativeRect caret,
         Native.NativeRect screen,
-        IntPtr viewHwnd)
+        IntPtr viewHwnd,
+        bool hasRangeSelection = false)
     {
         if (client.ContextEpoch != 0 && epoch < client.ContextEpoch)
         {
@@ -313,6 +341,7 @@ internal static class ImeClientState
             return false;
         }
 
+        var epochAdvanced = client.ContextEpoch != 0 && epoch > client.ContextEpoch;
         client.ContextSequence = sequence;
         client.ContextEpoch = epoch;
         client.DocumentFocused = active;
@@ -322,7 +351,13 @@ internal static class ImeClientState
         client.ThreadSequence = Math.Max(client.ThreadSequence, sequence);
         client.ProfileSequence = Math.Max(client.ProfileSequence, sequence);
         client.LayoutState = layoutState;
-        client.NativeCaret = layoutState == 1 ? caret : default;
+        client.HasRangeSelection = active && hasRangeSelection;
+        client.NativeCaret = NativeCaretPolicy.Apply(
+            client.NativeCaret,
+            caret,
+            layoutState,
+            active,
+            epochAdvanced);
         client.NativeScreen = screen;
         client.ViewHwnd = viewHwnd;
         return true;

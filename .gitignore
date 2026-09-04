@@ -16,3 +16,4 @@ src/T9Setup/payload.zip
 *.obj
 *.res
 *.exe
+*.out

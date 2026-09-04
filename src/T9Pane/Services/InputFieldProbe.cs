@@ -30,7 +30,13 @@ internal readonly record struct InputField(
     bool CaretIsTrusted = false,
     string FieldId = "",
     NativeRect FieldBox = default,
-    bool FromClicked = false);
+    bool FromClicked = false,
+    /// <summary>
+    /// 矩形是折叠后的插入点，而不是长按选区的外框。
+    /// 选区变大时不能拿来跟打字行，否则键盘会跟着手柄跳。
+    /// </summary>
+    bool IsInsertionCaret = true,
+    bool HasRangeSelection = false);
 
 internal static class InputFieldSelectionPolicy
 {
@@ -67,23 +73,28 @@ internal static class InputFieldSelectionPolicy
         && nativeField.Caret.Top <= uiField.Caret.Bottom + verticalTolerance;
 
     /// <summary>
-    /// 系统表面首显前是否还要再等一个更权威的坐标。
+    /// 首显前是否还要再等一个更权威的坐标。
     ///
+    /// 官方 ITfContextView.GetTextExt / TipTsfHelper：只在拿到插入点后摆。
     /// SearchHost 一类 XAML 表面从不提供原生 TSF 字段，所以只看 hasNativeField
     /// 就会让每一次首显都落进定时器兜底——表现就是开始菜单搜索框要多点一下。
     /// 坐标本身已经描述真实插入点时(UIA 光标、或用户刚点中的那个输入框)，
     /// 就没有什么可等的了，直接显示。
+    /// uia/box 锚在外框顶边，桌面和系统表面都要等 TextPattern / GetTextExt，
+    /// 否则键盘会压住真实行。
     /// </summary>
     public static bool NeedsAuthoritativeFirstShow(
         bool systemTextHost,
         bool hasUiField,
         InputField uiField,
         bool hasNativeField,
-        InputField nativeField) =>
-        systemTextHost
-        && hasUiField
-        && !uiField.CaretIsTrusted
-        && (!hasNativeField || !IsSameFocusedGeometry(uiField, nativeField));
+        InputField nativeField)
+    {
+        _ = systemTextHost;
+        return hasUiField
+            && !uiField.CaretIsTrusted
+            && (!hasNativeField || !IsSameFocusedGeometry(uiField, nativeField));
+    }
 
     public static bool TrySelect(
         bool systemTextHost,
@@ -103,7 +114,9 @@ internal static class InputFieldSelectionPolicy
             {
                 FieldBox = uiField.FieldBox.IsEmpty ? nativeField.FieldBox : uiField.FieldBox,
                 FieldId = string.IsNullOrEmpty(uiField.FieldId) ? nativeField.FieldId : uiField.FieldId,
-                FromClicked = uiField.FromClicked || nativeField.FromClicked
+                FromClicked = uiField.FromClicked || nativeField.FromClicked,
+                IsInsertionCaret = nativeField.IsInsertionCaret && uiField.IsInsertionCaret,
+                HasRangeSelection = nativeField.HasRangeSelection || uiField.HasRangeSelection
             };
             return true;
         }
@@ -208,6 +221,8 @@ internal static class InputInvocationProbe
         || type == ControlType.Menu
         || type == ControlType.TabItem
         || type == ControlType.ListItem
+        || type == ControlType.TreeItem
+        || type == ControlType.DataItem
         || type == ControlType.Hyperlink
         || type == ControlType.Slider
         || type == ControlType.ScrollBar
@@ -215,13 +230,63 @@ internal static class InputInvocationProbe
 
     /// <summary>
     /// 焦点落到这个控件是否表示用户离开了输入。
-    ///
-    /// ListItem 不能算。Windows 搜索弹出后会把焦点程序性地放到联想列表上，
-    /// SampleIME 只在 TSF 文档焦点换走时才藏候选窗，联想项仍属于同一文档。
-    /// 点列表项本身的隐藏由指针命中 Outside 处理，不能靠这条焦点事件。
+    /// TreeItem/DataItem 是 Cursor 文件树、资源管理器侧栏。
+    /// ListItem 在搜索联想里仍属同一文档，由 searchSession 挡住；
+    /// 键盘已经出来后点侧栏列表要收。
     /// </summary>
     public static bool SignalsLeftTextInput(ControlType type) =>
-        StopsAtControl(type) && type != ControlType.ListItem;
+        StopsAtControl(type)
+        && type != ControlType.Thumb
+        && type != ControlType.ScrollBar;
+
+    /// <summary>
+    /// 官方 RequireTouchInEditControl：点在侧栏/页面上，即使稍后程序把焦点
+    /// 送进编辑框也不弹。地址栏旁边的 Button 不是这一类。
+    /// </summary>
+    public static bool IsHardLeaveControl(ControlType type) =>
+        type == ControlType.TreeItem
+        || type == ControlType.ListItem
+        || type == ControlType.DataItem
+        || type == ControlType.TabItem
+        || type == ControlType.Hyperlink;
+
+    /// <summary>
+    /// 长按之后的选区手柄和选区菜单。地址栏工具带、普通按钮不算。
+    /// </summary>
+    public static bool IsContextMenu(ControlType type) =>
+        type == ControlType.Menu || type == ControlType.MenuItem;
+
+    public static bool IsSelectionHandle(ControlType type) =>
+        type == ControlType.Thumb;
+
+    public static bool IsSelectionChrome(ControlType type) =>
+        IsContextMenu(type) || IsSelectionHandle(type);
+
+    public static bool IsConsoleOrTerminal(AutomationElement? element)
+    {
+        if (element is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var hwnd = new IntPtr(element.Current.NativeWindowHandle);
+            var foreground = NativeMethods.GetAncestor(
+                NativeMethods.GetForegroundWindow(),
+                NativeMethods.GaRoot);
+            return ConsoleInputSurface.IsEditable(
+                element.Current.ControlType,
+                element.Current.Name,
+                element.Current.AutomationId,
+                hwnd,
+                foreground);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// Chromium 的 contenteditable 常报成 Document/Group，不是 Edit。
@@ -238,6 +303,18 @@ internal static class InputInvocationProbe
             || type == ControlType.Custom)
         && width >= 40
         && height is >= 12 and <= 160;
+
+    /// <summary>
+    /// 整页 Document/Pane/Window。点网页空白时焦点常落到这里，不是输入框。
+    /// </summary>
+    public static bool SignalsLeftPageSurface(
+        ControlType type,
+        double width,
+        double height,
+        bool keyboardFocusable) =>
+        StopsAtContainer(type)
+        && !IsCompactEditable(type, width, height, keyboardFocusable)
+        && height > 160;
 
     /// <summary>
     /// 走到这些容器就该停。它们本身不是输入框，而且 Chromium 会把整个网页暴露成
@@ -324,8 +401,9 @@ internal static class InputInvocationProbe
     public static PointerInputHit ClassifyContainerHit(
         bool compactEditable,
         bool foundCompactChild,
-        bool clickInsideAuthorizedField = false) =>
-        compactEditable || foundCompactChild || clickInsideAuthorizedField
+        bool clickInsideAuthorizedField = false,
+        bool consoleOrTerminal = false) =>
+        compactEditable || foundCompactChild || clickInsideAuthorizedField || consoleOrTerminal
             ? PointerInputHit.Inside
             : PointerInputHit.Unavailable;
 
@@ -425,6 +503,11 @@ internal static class InputInvocationProbe
         int y,
         NativeRect authorizedField = default)
     {
+        if (OfficialSipHit.IsKeyboardSurface(x, y))
+        {
+            return PointerInputHit.Unavailable;
+        }
+
         try
         {
             var node = AutomationElement.FromPoint(new System.Windows.Point(x, y));
@@ -453,7 +536,7 @@ internal static class InputInvocationProbe
                         box.Width,
                         box.Height,
                         node.Current.IsKeyboardFocusable || node.Current.HasKeyboardFocus);
-                    if (compact)
+                    if (compact || IsConsoleOrTerminal(node))
                     {
                         NoteClickedField(node);
                         return PointerInputHit.Inside;
@@ -468,7 +551,8 @@ internal static class InputInvocationProbe
                     return ClassifyContainerHit(
                         compactEditable: false,
                         foundCompactChild: false,
-                        clickInsideAuthorizedField: Contains(authorizedField, x, y, EdgeTolerance));
+                        clickInsideAuthorizedField: Contains(authorizedField, x, y, EdgeTolerance),
+                        consoleOrTerminal: false);
                 }
 
                 node = TreeWalker.ControlViewWalker.GetParent(node);
@@ -573,9 +657,11 @@ internal static class InputInvocationProbe
     public static PointerInputHit HitTestFocusedInput(
         int x,
         int y,
-        NativeRect authorizedField = default)
+        NativeRect authorizedField = default,
+        PointerInputHit? probedTarget = null)
     {
-        var clickedTextField = HitTestPointerTarget(x, y, authorizedField);
+        var clickedTextField = probedTarget
+            ?? HitTestPointerTarget(x, y, authorizedField);
         if (clickedTextField == PointerInputHit.Inside)
         {
             return PointerInputHit.Inside;
@@ -617,7 +703,7 @@ internal static class InputInvocationProbe
     /// 就还不能藏；落到整页 Document / 按钮才是真离开。
     /// 必须问 live FocusedElement，不能用焦点缓存——旧 Edit 会把失焦挡住。
     /// </summary>
-    public static bool FocusedLooksLikeTextInput()
+    public static bool FocusedIsLeaveControl()
     {
         try
         {
@@ -628,7 +714,95 @@ internal static class InputInvocationProbe
             }
 
             var type = focused.Current.ControlType;
-            if (IsTextField(type))
+            if (IsSelectionChrome(type) || IsTextField(type))
+            {
+                return false;
+            }
+
+            if (SignalsLeftTextInput(type))
+            {
+                return true;
+            }
+
+            var box = focused.Current.BoundingRectangle;
+            return SignalsLeftPageSurface(
+                type,
+                box.Width,
+                box.Height,
+                focused.Current.IsKeyboardFocusable || focused.Current.HasKeyboardFocus);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 焦点落定后（官方 IsUIBusy=False / TipTsfHelper Input 优先级）再问：
+    /// 是不是点在侧栏、页面上。Button 不算，留给地址栏铬。
+    /// </summary>
+    public static bool FocusedIsOwnPane()
+    {
+        try
+        {
+            var focused = CurrentFocusedElement() ?? AutomationElement.FocusedElement;
+            return focused is not null
+                && TrayFocusPolicy.IgnoreOwnProcess(
+                    unchecked((uint)focused.Current.ProcessId),
+                    unchecked((uint)Environment.ProcessId));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static bool FocusedIsHardLeave()
+    {
+        try
+        {
+            var focused = CurrentFocusedElement();
+            if (focused is null || FocusedIsOwnPane())
+            {
+                return false;
+            }
+
+            var type = focused.Current.ControlType;
+            if (IsSelectionChrome(type) || IsTextField(type) || IsConsoleOrTerminal(focused))
+            {
+                return false;
+            }
+
+            if (IsHardLeaveControl(type))
+            {
+                return true;
+            }
+
+            var box = focused.Current.BoundingRectangle;
+            return SignalsLeftPageSurface(
+                type,
+                box.Width,
+                box.Height,
+                focused.Current.IsKeyboardFocusable || focused.Current.HasKeyboardFocus);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static bool FocusedLooksLikeTextInput()
+    {
+        try
+        {
+            var focused = CurrentFocusedElement();
+            if (focused is null)
+            {
+                return false;
+            }
+
+            var type = focused.Current.ControlType;
+            if (IsTextField(type) || IsConsoleOrTerminal(focused))
             {
                 return true;
             }
@@ -674,11 +848,12 @@ internal static class InputInvocationProbe
         if (StopsAtContainer(type))
         {
             var box = focused.Current.BoundingRectangle;
-            if (IsCompactEditable(
+            if ((IsCompactEditable(
                     type,
                     box.Width,
                     box.Height,
                     focused.Current.IsKeyboardFocusable || focused.Current.HasKeyboardFocus)
+                || IsConsoleOrTerminal(focused))
                 && ClickLandedOn(focused, x, y))
             {
                 NoteClickedField(focused);
@@ -712,10 +887,11 @@ internal static class InputInvocationProbe
                 return false;
             }
 
-            return x >= box.Left - EdgeTolerance
-                && x < box.Right + EdgeTolerance
-                && y >= box.Top - EdgeTolerance
-                && y < box.Bottom + EdgeTolerance;
+            var slop = TouchDevicePolicy.EdgeTolerance(TouchDevicePolicy.CurrentPreferTouchHitSlop());
+            return x >= box.Left - slop
+                && x < box.Right + slop
+                && y >= box.Top - slop
+                && y < box.Bottom + slop;
         }
         catch
         {
@@ -729,6 +905,15 @@ internal static class InputInvocationProbe
     /// </summary>
     private static readonly TimeSpan FocusHandoffWindow =
         TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// AutomationElement.FocusedElement 在跨进程焦点交接后会继续返回旧
+    /// Edit。焦点事件送来的元素才是这一拍的权威焦点，必须先看缓存。
+    /// 第一下点到按钮时若仍读旧 Edit，键盘会 Stay，第二下才收。
+    /// </summary>
+    private static AutomationElement? CurrentFocusedElement() =>
+        FocusedFieldCache.Fresh(FocusHandoffWindow)
+        ?? AutomationElement.FocusedElement;
 
 }
 
@@ -753,7 +938,15 @@ internal static class InputFieldProbe
             return false;
         }
 
-        field = new InputField(top, caret, default, CaretIsTrusted: true, FieldId: LastFieldId, FieldBox: LastFieldBox);
+        field = new InputField(
+            top,
+            caret,
+            default,
+            CaretIsTrusted: CaretQualityGate.Rank($"uia/{LastAutomationSource}") >= 3,
+            FieldId: LastFieldId,
+            FieldBox: LastFieldBox,
+            IsInsertionCaret: LastCaretIsInsertion,
+            HasRangeSelection: LastHasRangeSelection);
         return true;
     }
 
@@ -794,6 +987,8 @@ internal static class InputFieldProbe
             : default;
         LastFieldId = string.Empty;
         LastFieldBox = default;
+        LastCaretIsInsertion = true;
+        LastHasRangeSelection = false;
         // 必须先问点中的框。Cursor 会把焦点留在聊天框，UIA/TSF 光标都是那个框的；
         // 先读焦点就会把键盘摆到错位置。注释一直这么写，实现却先读了焦点。
         var caret = TryReadClickedFieldCaret(out var source);
@@ -812,6 +1007,12 @@ internal static class InputFieldProbe
                 ? TryReadCaret()
                 : TryReadAutomation(top, allowSystemBroker: framedSurface);
             source = uiaFirst ? "caret" : $"uia/{LastAutomationSource}";
+        }
+
+        if (caret.IsEmpty && ConsoleInputSurface.IsWindow(top))
+        {
+            caret = TryReadConsoleInsertion(top, element: null);
+            source = "console";
         }
 
         // 这里原先还有一条"按窗口矩形编造坐标"的兜底(FindSearchBox)。已经删除：
@@ -834,15 +1035,18 @@ internal static class InputFieldProbe
             $"取输入框 表面={ShellProcess.Name(top)} 来源={source}{(held ? "(沿用)" : "")} "
             + $"光标=({caret.Left},{caret.Top})-({caret.Right},{caret.Bottom})");
 
-        // 编造坐标那条路已经删除，剩下的每条都来自真实的插入点或真实的元素外框。
+        // GetTextExt / TextPattern 才是插入点。uia/box 锚在外框顶边，
+        // 官方候选窗不会拿 BoundingRectangle 去 CFS_EXCLUDE。
         field = new InputField(
             top,
             caret,
             occluder,
-            CaretIsTrusted: true,
+            CaretIsTrusted: CaretQualityGate.Rank(source) >= 3 || fromClicked,
             FieldId: LastFieldId,
             FieldBox: LastFieldBox,
-            FromClicked: fromClicked);
+            FromClicked: fromClicked,
+            IsInsertionCaret: LastCaretIsInsertion,
+            HasRangeSelection: LastHasRangeSelection);
         return true;
     }
 
@@ -861,6 +1065,8 @@ internal static class InputFieldProbe
             return default;
         }
 
+        LastCaretIsInsertion = true;
+        LastHasRangeSelection = false;
         return new NativeRect
         {
             Left = tl.X,
@@ -1028,15 +1234,27 @@ internal static class InputFieldProbe
         }
 
         var box = CaretFromElementBox(editor);
-        if (box.IsEmpty)
+        if (!box.IsEmpty)
         {
-            LastReject = "点中的输入框外框不可用";
-            return default;
+            LastAutomationSource = "box";
+            LastReject = string.Empty;
+            return box;
         }
 
-        LastAutomationSource = "box";
-        LastReject = string.Empty;
-        return box;
+        if (InputInvocationProbe.IsConsoleOrTerminal(editor)
+            || ConsoleInputSurface.IsWindow(ElementHwnd(editor)))
+        {
+            var console = TryReadConsoleInsertion(ElementHwnd(editor), editor);
+            if (!console.IsEmpty)
+            {
+                LastAutomationSource = "console";
+                LastReject = string.Empty;
+                return console;
+            }
+        }
+
+        LastReject = "点中的输入框外框不可用";
+        return default;
     }
 
     /// <summary>
@@ -1053,6 +1271,8 @@ internal static class InputFieldProbe
                 return default;
             }
 
+            LastCaretIsInsertion = false;
+            LastHasRangeSelection = false;
             return new NativeRect
             {
                 Left = (int)box.Left + 4,
@@ -1098,7 +1318,163 @@ internal static class InputFieldProbe
             return caret;
         }
 
-        return CaretFromElementBox(element);
+        var box = CaretFromElementBox(element);
+        if (!box.IsEmpty)
+        {
+            return box;
+        }
+
+        if (InputInvocationProbe.IsConsoleOrTerminal(element)
+            || ConsoleInputSurface.IsWindow(ElementHwnd(element)))
+        {
+            var console = TryReadConsoleInsertion(ElementHwnd(element), element);
+            if (!console.IsEmpty)
+            {
+                source = "console";
+                return console;
+            }
+        }
+
+        return default;
+    }
+
+    private static IntPtr ElementHwnd(AutomationElement element)
+    {
+        try
+        {
+            return new IntPtr(element.Current.NativeWindowHandle);
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
+    }
+
+    /// <summary>
+    /// 控制台/终端没有 Edit 子节点。优先 Win32 插入符，否则用客户区底行——
+    /// 那是提示符所在的真实客户区，不是按窗口外框编造。
+    /// </summary>
+    private static NativeRect TryReadConsoleInsertion(IntPtr hwnd, AutomationElement? element)
+    {
+        if (hwnd == IntPtr.Zero && element is not null)
+        {
+            hwnd = ElementHwnd(element);
+        }
+
+        if (hwnd == IntPtr.Zero)
+        {
+            hwnd = NativeMethods.GetAncestor(
+                NativeMethods.GetForegroundWindow(),
+                NativeMethods.GaRoot);
+        }
+
+        var gui = TryReadCaret();
+        if (!gui.IsEmpty)
+        {
+            if (element is not null)
+            {
+                RememberField(element);
+            }
+            else
+            {
+                RememberConsoleField(hwnd);
+            }
+
+            LastAutomationSource = "caret";
+            LastReject = string.Empty;
+            return gui;
+        }
+
+        if (element is not null)
+        {
+            try
+            {
+                var bounds = element.Current.BoundingRectangle;
+                if (!bounds.IsEmpty && bounds.Height >= 12)
+                {
+                    RememberField(element);
+                    LastCaretIsInsertion = true;
+                    LastHasRangeSelection = false;
+                    LastAutomationSource = "box";
+                    LastReject = string.Empty;
+                    return new NativeRect
+                    {
+                        Left = (int)bounds.Left + 8,
+                        Top = (int)bounds.Bottom - 22,
+                        Right = (int)bounds.Left + 10,
+                        Bottom = (int)bounds.Bottom - 4
+                    };
+                }
+            }
+            catch
+            {
+                // 元素已随宿主销毁。
+            }
+        }
+
+        if (!ConsoleInputSurface.IsWindow(hwnd)
+            || !NativeMethods.GetClientRect(hwnd, out var client)
+            || client.IsEmpty)
+        {
+            return default;
+        }
+
+        var origin = new NativePoint { X = 0, Y = 0 };
+        var corner = new NativePoint { X = client.Right, Y = client.Bottom };
+        var caretTop = new NativePoint { X = 8, Y = Math.Max(0, client.Bottom - 22) };
+        var caretBottom = new NativePoint { X = 10, Y = Math.Max(caretTop.Y + 18, client.Bottom - 2) };
+        if (!NativeMethods.ClientToScreen(hwnd, ref origin)
+            || !NativeMethods.ClientToScreen(hwnd, ref corner)
+            || !NativeMethods.ClientToScreen(hwnd, ref caretTop)
+            || !NativeMethods.ClientToScreen(hwnd, ref caretBottom))
+        {
+            return default;
+        }
+
+        LastFieldId = $"console:{hwnd.ToInt64():X}";
+        LastFieldBox = new NativeRect
+        {
+            Left = origin.X,
+            Top = origin.Y,
+            Right = corner.X,
+            Bottom = corner.Y
+        };
+        LastCaretIsInsertion = true;
+        LastHasRangeSelection = false;
+        LastAutomationSource = "box";
+        LastReject = string.Empty;
+        return new NativeRect
+        {
+            Left = caretTop.X,
+            Top = caretTop.Y,
+            Right = caretBottom.X,
+            Bottom = caretBottom.Y
+        };
+    }
+
+    private static void RememberConsoleField(IntPtr hwnd)
+    {
+        if (!NativeMethods.GetClientRect(hwnd, out var client) || client.IsEmpty)
+        {
+            return;
+        }
+
+        var origin = new NativePoint { X = 0, Y = 0 };
+        var corner = new NativePoint { X = client.Right, Y = client.Bottom };
+        if (!NativeMethods.ClientToScreen(hwnd, ref origin)
+            || !NativeMethods.ClientToScreen(hwnd, ref corner))
+        {
+            return;
+        }
+
+        LastFieldId = $"console:{hwnd.ToInt64():X}";
+        LastFieldBox = new NativeRect
+        {
+            Left = origin.X,
+            Top = origin.Y,
+            Right = corner.X,
+            Bottom = corner.Y
+        };
     }
 
     private static string _lastLogged = string.Empty;
@@ -1135,6 +1511,8 @@ internal static class InputFieldProbe
     /// </summary>
     private static string LastFieldId = string.Empty;
     private static NativeRect LastFieldBox;
+    private static bool LastCaretIsInsertion = true;
+    private static bool LastHasRangeSelection;
 
     private static void RememberField(AutomationElement element)
     {
@@ -1189,13 +1567,14 @@ internal static class InputFieldProbe
     private static string LastReject = string.Empty;
 
     /// <summary>
-    /// 用 TextPattern 取光标所在行的矩形。
+    /// 用 TextPattern 取折叠后的插入点矩形，不用整段选区外框。
     ///
     /// 官方专门取光标的 ITextProvider2::GetCaretRange 在 Chromium 上不可用
     /// (它只实现了 ITextProvider 和 ITextEditProvider)，而 GetBoundingRectangles
     /// 对退化(空)范围按规范返回空数组，所以纯光标的选区直接问是拿不到矩形的。
     /// 把退化范围向后扩一个字符使其非退化，取回的第一个矩形就是光标那一行；
     /// 光标在文本末尾时无法向后扩，改为向前扩并取末尾矩形的右边缘。
+    /// 非空选区只折叠到终点再取一小段，避免长按手柄把“光标行”拉到选区另一头。
     /// </summary>
     private static NativeRect TryReadTextPatternCaret(AutomationElement element)
     {
@@ -1212,58 +1591,76 @@ internal static class InputFieldProbe
                 return default;
             }
 
-            var forward = true;
-            var rects = selection[0].GetBoundingRectangles();
-            if (rects.Length == 0)
+            var range = selection[0];
+            var insertion = range.CompareEndpoints(
+                TextPatternRangeEndpoint.Start,
+                range,
+                TextPatternRangeEndpoint.End) == 0;
+            LastCaretIsInsertion = insertion;
+            LastHasRangeSelection = !insertion;
+            if (!insertion)
             {
-                var ahead = selection[0].Clone();
-                if (ahead.MoveEndpointByUnit(
-                        TextPatternRangeEndpoint.End,
-                        TextUnit.Character,
-                        1) != 0)
-                {
-                    rects = ahead.GetBoundingRectangles();
-                }
-            }
-            if (rects.Length == 0)
-            {
-                var behind = selection[0].Clone();
-                if (behind.MoveEndpointByUnit(
-                        TextPatternRangeEndpoint.Start,
-                        TextUnit.Character,
-                        -1) != 0)
-                {
-                    forward = false;
-                    rects = behind.GetBoundingRectangles();
-                }
-            }
-            if (rects.Length == 0)
-            {
-                return default;
+                range = range.Clone();
+                range.MoveEndpointByRange(
+                    TextPatternRangeEndpoint.Start,
+                    range,
+                    TextPatternRangeEndpoint.End);
             }
 
-            // 多行选区时插入点在末行。取第一行会把键盘贴到段首，盖住正在打的字。
-            // 从退化光标只扩出一块矩形时 [^1] 就是那一行。
-            var line = rects[^1];
-            if (line.IsEmpty || line.Height is < 8 or > 120)
-            {
-                return default;
-            }
-
-            // 向后扩时插入点在矩形左边缘，向前扩时在右边缘。
-            var x = (int)(forward ? line.Left : line.Right);
-            return new NativeRect
-            {
-                Left = x,
-                Top = (int)line.Top,
-                Right = x + 2,
-                Bottom = (int)(line.Top + Math.Max(18, line.Height))
-            };
+            return ReadRangeCaret(range);
         }
         catch
         {
             return default;
         }
+    }
+
+    private static NativeRect ReadRangeCaret(TextPatternRange range)
+    {
+        var forward = true;
+        var rects = range.GetBoundingRectangles();
+        if (rects.Length == 0)
+        {
+            var ahead = range.Clone();
+            if (ahead.MoveEndpointByUnit(
+                    TextPatternRangeEndpoint.End,
+                    TextUnit.Character,
+                    1) != 0)
+            {
+                rects = ahead.GetBoundingRectangles();
+            }
+        }
+        if (rects.Length == 0)
+        {
+            var behind = range.Clone();
+            if (behind.MoveEndpointByUnit(
+                    TextPatternRangeEndpoint.Start,
+                    TextUnit.Character,
+                    -1) != 0)
+            {
+                forward = false;
+                rects = behind.GetBoundingRectangles();
+            }
+        }
+        if (rects.Length == 0)
+        {
+            return default;
+        }
+
+        var line = rects[0];
+        if (line.IsEmpty || line.Height is < 8 or > 120)
+        {
+            return default;
+        }
+
+        var x = (int)(forward ? line.Left : line.Right);
+        return new NativeRect
+        {
+            Left = x,
+            Top = (int)line.Top,
+            Right = x + 2,
+            Bottom = (int)(line.Top + Math.Max(18, line.Height))
+        };
     }
 
     private static IntPtr Root(IntPtr hwnd) =>

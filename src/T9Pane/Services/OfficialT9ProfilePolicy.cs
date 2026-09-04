@@ -15,6 +15,12 @@ internal static class OfficialT9ProfilePolicy
     public static bool IsT9Layout(Guid clsid, Guid profile) =>
         clsid == T9Clsid && (profile == Guid.Empty || profile == T9Profile);
 
+    /// <summary>
+    /// 当前语言栏才算选中。CTF 默认程序集即使仍是 T9，切到微软拼音后也不算。
+    /// </summary>
+    public static bool IsCurrentSelection(bool getActiveSucceeded, bool isT9Layout) =>
+        getActiveSucceeded && isT9Layout;
+
     public static bool TryParseAssembly(string? clsidText, string? profileText, out Guid clsid, out Guid profile)
     {
         clsid = default;

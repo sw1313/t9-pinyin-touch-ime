@@ -28,6 +28,13 @@ internal static class NativeMethods
     public const int SwpFrameChanged = 0x0020;
     public const int SwpAsyncWindowPos = 0x4000;
     public const int DwmwaCloak = 13;
+    public const int WmTabletQuerySystemGestureStatus = 0x02CC;
+    public const int TabletDisablePressAndHold = 0x00000001;
+    public const int TabletDisablePenTapFeedback = 0x00000008;
+    public const int TabletDisablePenBarrelFeedback = 0x00000010;
+    public const int TabletDisableFlicks = 0x00010000;
+    public const int GcAllGestures = 0x00000001;
+    public const string TabletPenServiceProperty = "MicrosoftTabletPenServiceProperty";
     public const int DwmwaCloaked = 14;
     public const uint MonitorDefaultToNearest = 2;
     public const int RgnDiff = 4;
@@ -80,7 +87,18 @@ internal static class NativeMethods
     public const int WmChar = 0x0102;
     public const int WmQuit = 0x0012;
     public const int WmLeftButtonDown = 0x0201;
+    public const int WmLeftButtonUp = 0x0202;
+    public const int WmRightButtonDown = 0x0204;
+    public const int WmInput = 0x00FF;
+    public const uint SpiGetKeyboardSpeed = 0x000A;
+    public const uint SpiGetKeyboardDelay = 0x0016;
     public const int WhMouseLowLevel = 14;
+    public const uint RidevRemove = 0x00000001;
+    public const uint RidevInputSink = 0x00000100;
+    public const ushort HidPageDigitizer = 0x0D;
+    public const ushort HidUsageDigitizer = 0x01;
+    public const ushort HidUsageTouchScreen = 0x04;
+    public const ushort HidUsageTouchPad = 0x05;
     public const int WmSysCommand = 0x0112;
     public const int ScClose = 0xF060;
     public const int ScTaskList = 0xF130;
@@ -99,6 +117,16 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out NativeRect lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetClientRect(IntPtr hWnd, out NativeRect lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool SystemParametersInfo(
+        uint uiAction,
+        uint uiParam,
+        out int pvParam,
+        uint fWinIni);
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
@@ -218,8 +246,46 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern IntPtr WindowFromPoint(NativePoint point);
 
+    [DllImport("user32.dll")]
+    public static extern bool GetPointerInfo(uint pointerId, out PointerInfo info);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetGestureConfig(
+        IntPtr hwnd,
+        uint reserved,
+        uint idCount,
+        [In] GestureConfig[] gestureConfig,
+        uint size);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool SetProp(IntPtr hwnd, string name, IntPtr data);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern ushort RegisterClassEx(ref WndClassEx lpwcx);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateWindowEx(
+        int dwExStyle,
+        string lpClassName,
+        string lpWindowName,
+        int dwStyle,
+        int x,
+        int y,
+        int nWidth,
+        int nHeight,
+        IntPtr hWndParent,
+        IntPtr hMenu,
+        IntPtr hInstance,
+        IntPtr lpParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool DispatchMessage(ref NativeMessage lpmsg);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool RegisterRawInputDevices(
+        RawInputDevice[] pRawInputDevices,
+        uint uiNumDevices,
+        uint cbSize);
 
     [DllImport("user32.dll")]
     public static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
@@ -229,6 +295,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
 
     [DllImport("kernel32.dll")]
     public static extern IntPtr GetCurrentProcess();
@@ -269,6 +338,8 @@ internal static class NativeMethods
     public const uint EventSystemForeground = 0x0003;
     public const uint EventSystemAlert = 0x0002;
     public const uint EventObjectFocus = 0x8005;
+    public const uint EventObjectShow = 0x8002;
+    public const uint EventObjectUncloaked = 0x8018;
     public const uint ClsctxInprocServer = 1;
     public const uint CoinitApartmentThreaded = 2;
     public const uint WmGetObject = 0x003D;
@@ -615,6 +686,35 @@ internal struct NativePoint
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct GestureConfig
+{
+    public uint Id;
+    public uint Want;
+    public uint Block;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PointerInfo
+{
+    public uint PointerType;
+    public uint PointerId;
+    public uint FrameId;
+    public uint PointerFlags;
+    public IntPtr SourceDevice;
+    public IntPtr HwndTarget;
+    public NativePoint PixelLocation;
+    public NativePoint HimetricLocation;
+    public NativePoint PixelLocationRaw;
+    public NativePoint HimetricLocationRaw;
+    public uint Time;
+    public uint HistoryCount;
+    public int InputData;
+    public uint KeyStates;
+    public ulong PerformanceCount;
+    public uint ButtonChangeType;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct LowLevelMouseHookData
 {
     public NativePoint Point;
@@ -728,4 +828,13 @@ internal struct HARDWAREINPUT
     public uint Msg;
     public ushort ParamL;
     public ushort ParamH;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct RawInputDevice
+{
+    public ushort UsagePage;
+    public ushort Usage;
+    public uint Flags;
+    public IntPtr Target;
 }

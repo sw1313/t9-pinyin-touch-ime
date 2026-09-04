@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Interop;
 using T9Pane.Native;
+using T9Pane.Services;
 
 namespace T9Pane.Overlay;
 
@@ -25,6 +26,8 @@ internal class NoActivateWindow : Window
         {
             source.AddHook(WndProc);
         }
+
+        TabletGesturePolicy.DisablePressAndHold(hwnd);
     }
 
     private static IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -33,6 +36,12 @@ internal class NoActivateWindow : Window
         {
             handled = true;
             return new IntPtr(NativeMethods.MaNoActivate);
+        }
+
+        if (msg == NativeMethods.WmTabletQuerySystemGestureStatus)
+        {
+            handled = true;
+            return new IntPtr(TabletGesturePolicy.QueryStatus());
         }
 
         return IntPtr.Zero;

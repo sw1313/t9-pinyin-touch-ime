@@ -3,6 +3,20 @@ using T9Pane.Native;
 
 namespace T9Pane.Services;
 
+internal static class FocusGenerationPolicy
+{
+    /// <summary>
+    /// 只有前台窗口真的换了才换代。
+    ///
+    /// 代号会进 InputContextKey，定位那边靠上下文是否相同来决定「同一行就别动」
+    /// 和「要不要收起重来」。焦点事件在打字时照样会来，Chromium 和 UWP 尤其密，
+    /// 每来一次就换代的话上下文看着一直在变，键盘就跟着光标左右漂、甚至被当成
+    /// 换了表面而重启。前台拿不到时按没换算，免得来回抖。
+    /// </summary>
+    public static bool ShouldAdvance(IntPtr current, IntPtr next) =>
+        next != IntPtr.Zero && next != current;
+}
+
 internal sealed class ForegroundTracker : IDisposable
 {
     private readonly HashSet<IntPtr> _ignored = [];
@@ -14,6 +28,7 @@ internal sealed class ForegroundTracker : IDisposable
     private readonly TrailingEdgeGate _gate = new();
     private bool _automationFocusHooked;
     private long _generation;
+    private IntPtr _generationTarget;
 
     public IntPtr LastTarget { get; private set; }
     public long Generation => Interlocked.Read(ref _generation);
@@ -86,7 +101,39 @@ internal sealed class ForegroundTracker : IDisposable
     /// </summary>
     public bool FocusLeftTextInput { get; private set; }
 
-    public void ClearFocusLeft() => FocusLeftTextInput = false;
+    /// <summary>
+    /// 焦点刚进输入框。平板上用来补一次弹出授权；指针已经判定过则清掉，
+    /// 避免点了列表还按旧输入框的焦点把键盘拉起来。
+    /// </summary>
+    public bool FocusEnteredTextInput { get; private set; }
+
+    /// <summary>
+    /// 焦点落到整页 Document/Pane，不是矮输入框。
+    /// </summary>
+    public bool FocusOnPageSurface { get; private set; }
+
+    /// <summary>
+    /// 这次离开是选区手柄/选区菜单，不是按钮或页面。
+    /// </summary>
+    public bool FocusLeftIsSelectionChrome { get; private set; }
+
+    /// <summary>焦点在右键/长按弹出的菜单上。</summary>
+    public bool FocusIsContextMenu { get; private set; }
+
+    /// <summary>
+    /// 最近一次 UIA 焦点元素的屏幕外框。用来区分「地址栏边上的按钮」和「侧栏列表」。
+    /// </summary>
+    public NativeRect LastFocusBounds { get; private set; }
+
+    public void ClearFocusLeft()
+    {
+        FocusLeftTextInput = false;
+        FocusOnPageSurface = false;
+        FocusLeftIsSelectionChrome = false;
+        FocusIsContextMenu = false;
+    }
+
+    public void ClearFocusEntered() => FocusEnteredTextInput = false;
 
     private void OnAutomationFocusChanged(object sender, AutomationFocusChangedEventArgs args)
     {
@@ -128,17 +175,78 @@ internal sealed class ForegroundTracker : IDisposable
             }
 
             var type = element.Current.ControlType;
-            if (InputInvocationProbe.IsTextField(type))
+            var box = element.Current.BoundingRectangle;
+            if (!box.IsEmpty)
             {
+                LastFocusBounds = new NativeRect
+                {
+                    Left = (int)Math.Floor(box.Left),
+                    Top = (int)Math.Floor(box.Top),
+                    Right = (int)Math.Ceiling(box.Right),
+                    Bottom = (int)Math.Ceiling(box.Bottom)
+                };
+            }
+
+            if (InputInvocationProbe.IsTextField(type)
+                || InputInvocationProbe.IsConsoleOrTerminal(element))
+            {
+                FocusLeftTextInput = false;
+                FocusOnPageSurface = false;
+                FocusLeftIsSelectionChrome = false;
+                FocusIsContextMenu = false;
+                FocusEnteredTextInput = true;
+                return;
+            }
+
+            var focusable = element.Current.IsKeyboardFocusable
+                || element.Current.HasKeyboardFocus;
+            if (InputInvocationProbe.IsCompactEditable(
+                    type,
+                    box.Width,
+                    box.Height,
+                    focusable))
+            {
+                FocusLeftTextInput = false;
+                FocusOnPageSurface = false;
+                FocusLeftIsSelectionChrome = false;
+                FocusIsContextMenu = false;
+                FocusEnteredTextInput = true;
+                return;
+            }
+
+            if (InputInvocationProbe.IsSelectionChrome(type))
+            {
+                FocusLeftIsSelectionChrome = true;
+                FocusIsContextMenu = InputInvocationProbe.IsContextMenu(type);
+                FocusOnPageSurface = false;
                 FocusLeftTextInput = false;
                 return;
             }
 
-            // 容器(Chromium 的 Document/Pane)里可能就装着输入框，说明不了问题，
-            // 保持原判。只有按钮一类可操作控件才是确定的"不是要输入"。
+            if (InputInvocationProbe.SignalsLeftPageSurface(
+                    type,
+                    box.Width,
+                    box.Height,
+                    focusable))
+            {
+                // 整页 Document 说明不了离开。Chromium 打字时焦点会漂到页面，
+                // 当成 FocusLeft 会每拍收起再授权，热路径被 UIA 拖死。
+                // 但「刚进过输入框」必须清掉，否则点空白后 armed 永远被挡着。
+                FocusOnPageSurface = true;
+                FocusLeftIsSelectionChrome = false;
+                FocusIsContextMenu = false;
+                FocusEnteredTextInput = false;
+                return;
+            }
+
+            // 按钮、链接是确定离开。选区手柄已在上面单独记下。
             if (InputInvocationProbe.SignalsLeftTextInput(type))
             {
                 FocusLeftTextInput = true;
+                FocusOnPageSurface = false;
+                FocusLeftIsSelectionChrome = false;
+                FocusIsContextMenu = false;
+                FocusEnteredTextInput = false;
             }
         }
         catch
@@ -179,7 +287,12 @@ internal sealed class ForegroundTracker : IDisposable
             LastTarget = fgTop;
         }
 
-        Interlocked.Increment(ref _generation);
+        if (FocusGenerationPolicy.ShouldAdvance(_generationTarget, fgTop))
+        {
+            _generationTarget = fgTop;
+            Interlocked.Increment(ref _generation);
+        }
+
         Changed?.Invoke();
 
         if (_gate.ShouldRerun())

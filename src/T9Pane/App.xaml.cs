@@ -22,6 +22,11 @@ public partial class App
     private TsfProfileActivationSink? _profileSink;
     private readonly WindowFitter _fitter = new();
 
+    /// <summary>
+    /// 0=空闲，1=只跟线，2=全量同步。连发时只升不降：焦点事件必须盖过布局事件。
+    /// </summary>
+    private int _syncQueued;
+
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
@@ -69,6 +74,9 @@ public partial class App
         _overlay = new T9OverlayWindow(_engine, _settings, _foreground);
         _session = new KeyboardSession(_settings, _overlay, _foreground);
         _pointerIntent = new PointerIntentTracker(work => Dispatcher.BeginInvoke(work));
+        _pointerIntent.TouchContact += () => _session?.NoteTouchModality();
+        _pointerIntent.PointerUp += () => _session?.NotePointerUp();
+        _pointerIntent.ContextMenu += () => _session?.NoteContextMenu();
         _pointerIntent.PointerDown += (x, y, target, targetPid, origin) =>
         {
             if (!PointerIntentTrackingPolicy.IsKeyboardWindow(
@@ -92,12 +100,26 @@ public partial class App
             }
         };
         // 先挂 Changed，再 Start：启动时读到的语言栏才能立刻 Sync 握「显示触摸键盘」。
-        ImeHost.Shared.Changed += () => Dispatcher.BeginInvoke(() =>
+        ImeHost.Shared.Changed += () =>
         {
-            UpdatePointerTracking();
-            _session.NoteImeChanged();
-            _session.Sync(ImeHost.Shared.HasDocumentFocus);
-        });
+            var incoming = ImeHost.Shared.LastChangeIsLayoutOnly ? 1 : 2;
+            while (true)
+            {
+                var current = Volatile.Read(ref _syncQueued);
+                var next = incoming == 2 || current == 2 ? 2 : 1;
+                if (Interlocked.CompareExchange(ref _syncQueued, next, current) != current)
+                {
+                    continue;
+                }
+
+                if (current == 0)
+                {
+                    Dispatcher.BeginInvoke(FlushImeSync);
+                }
+
+                return;
+            }
+        };
         ImeHost.Shared.Start();
         _profileSink = new TsfProfileActivationSink(ImeHost.Shared.NoteThreadProfile);
         _profileSink.Start();
@@ -109,7 +131,7 @@ public partial class App
             UpdatePointerTracking();
             _pointerIntent?.RefreshShellTargets();
             _chromiumA11y?.NoteForeground(_foreground.LastTarget);
-            _session?.Sync();
+            _session?.NoteFocusSettled();
         });
         _tray = new TrayHost(
             _settings,
@@ -126,11 +148,25 @@ public partial class App
 
     private void Sync() => _session?.Sync();
 
+    private void FlushImeSync()
+    {
+        var kind = Interlocked.Exchange(ref _syncQueued, 0);
+        if (kind == 0 || _session is null)
+        {
+            return;
+        }
+
+        UpdatePointerTracking();
+        _session.NoteImeChanged();
+        _session.Sync(ImeHost.Shared.HasDocumentFocus, layoutOnly: kind == 1);
+    }
+
     private void UpdatePointerTracking() =>
-        _pointerIntent?.SetEnabled(PointerIntentTrackingPolicy.ShouldEnable(
+        _pointerIntent?.SetEnabled(PointerIntentTrackingPolicy.ShouldEnableForSession(
             ImeHost.Shared.CanCommitForeground(),
             ImeHost.Shared.HasForegroundProfileLease(),
-            ImeHost.Shared.HasSystemProfileLease()));
+            ImeHost.Shared.HasSystemProfileLease(),
+            ImeHost.Shared.HasOfficialT9Profile()));
 
     private void ReloadLexicon()
     {
@@ -149,7 +185,6 @@ public partial class App
     {
         _pointerIntent?.Dispose();
         _chromiumA11y?.Dispose();
-        _session?.Shutdown();
         _profileSink?.Dispose();
         ImeHost.Shared.Dispose();
         _overlay?.HideOverlay();

@@ -20,6 +20,21 @@ internal static class HostFrame
         bool hostReady) =>
         !sameHost || !sameContext || !hostReady;
 
+    /// <summary>
+    /// HostRender 起来后不能把本地窗 SWP_HIDE：WPF 一藏布局会收矮，
+    /// RenderTargetBitmap 停在第一张图。挪到屏外并保持显示。
+    /// </summary>
+    public const int ParkOffset = -32000;
+
+    public static bool ShouldParkLocalWindow(bool hosting, bool hostReady) =>
+        hosting && hostReady;
+
+    /// <summary>
+    /// 建盘后的第一帧必须等 Loaded，不能排在 Render。
+    /// Render 早于新子树的布局，九键第一次弹出就会画出盘面、点不中键。
+    /// </summary>
+    public static DispatcherPriority PublishPriority => DispatcherPriority.Loaded;
+
     internal static bool CanReuseBuffer(
         int cachedWidth,
         int cachedHeight,
@@ -63,7 +78,7 @@ internal static class HostFrame
             return;
         }
 
-        var size = ContentSize(window.ActualWidth, window.ActualHeight, window.Width, window.Height);
+        var size = ContentSize(window.Width, window.Height, window.Width, window.Height);
         element.InvalidateMeasure();
         element.Measure(size);
         element.Arrange(new System.Windows.Rect(size));
@@ -93,7 +108,7 @@ internal static class HostFrame
         using var scope = Perf.Begin("host.capture");
         Prepare(window);
         var dpi = VisualTreeHelper.GetDpi(window);
-        var layout = ContentSize(window.ActualWidth, window.ActualHeight, window.Width, window.Height);
+        var layout = ContentSize(window.Width, window.Height, window.Width, window.Height);
         width = Math.Max(8, (int)Math.Round(layout.Width * dpi.DpiScaleX));
         height = Math.Max(8, (int)Math.Round(layout.Height * dpi.DpiScaleY));
 

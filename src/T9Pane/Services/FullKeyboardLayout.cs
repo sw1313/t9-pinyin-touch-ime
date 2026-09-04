@@ -202,8 +202,8 @@ internal static class T9KeyFace
         "分词", "ABC", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ"
     ];
 
-    public const double FontSize = 16;
-    public const double EnglishFontSize = 20;
+    public const double FontSize = 19;
+    public const double EnglishFontSize = 24;
     public const double SymbolFontSize = 26;
     public const double NumberFontSize = 22;
     public const bool SymbolSemiBold = false;
@@ -216,6 +216,10 @@ internal static class T9KeyFace
 /// </summary>
 internal static class KeyboardChromeSize
 {
+    /// <summary>
+    /// 只放大九键 3×3 和英文 26 键。标题、候选、功能键、数字/符号保持原尺寸。
+    /// </summary>
+    public const double PadScale = 1.2;
     public const double FramePad = 16;
     public const double Title = 38;
     public const double Candidate = 34;
@@ -223,11 +227,14 @@ internal static class KeyboardChromeSize
     public const double CandidateCell = 38;
     public const double Function = 52;
     public const double CompactWidth = 400;
-    public const double CompactHeight = 360;
-    public const double EnglishWidth = 780;
+    public const double CompactBoard = 220;
+    public const double T9Board = CompactBoard * PadScale;
+    public const double CompactHeight = FramePad + Title + Candidate + Function + T9Board;
     public const double EnglishRail = 64;
+    public const double EnglishLetterUnit = 63.6 * PadScale;
+    public const double EnglishWidth = FramePad + EnglishRail * 2 + EnglishLetterUnit * 10;
     public const double SymbolRail = 52;
-    public const double FullWidth = 840;
+    public const double FullWidth = 840 * PadScale;
     public const double NumberColumns = 3;
     public const double NumberRows = 4;
 
@@ -246,10 +253,10 @@ internal static class KeyboardChromeSize
         FittedHeight(FullWidth, FullKeyboardLayout.Units, FullKeyboardLayout.RowCount, false);
 
     /// <summary>
-    /// 数字盘和九键共用同一格宽。旧算法按 CompactWidth 铺 3 列，
+    /// 数字盘保持未放大的方格。旧算法按 CompactWidth 铺 3 列，
     /// 键几乎比 T9 大一倍。
     /// </summary>
-    public static double CompactUnit => CompactColumns().Board / 3;
+    public static double CompactUnit => CompactBoard / 3;
 
     /// <summary>
     /// 数字盘窗口跟九键一样宽，标题和底栏才显示得下。
@@ -279,8 +286,6 @@ internal static class KeyboardChromeSize
     }
 
     /// <summary>英文 26 键按列宽取方格，三行刚好接近正方形。</summary>
-    public static double EnglishLetterUnit => EnglishColumns().Board / 10;
-
     public static double EnglishBoardHeight => EnglishLetterUnit * 3;
 
     public static double EnglishHeight =>
@@ -288,7 +293,7 @@ internal static class KeyboardChromeSize
 
     public static (double Rail, double Board) CompactColumns()
     {
-        var board = CompactHeight - FramePad - Title - Candidate - Function;
+        var board = T9Board;
         var rail = (CompactWidth - FramePad - board) / 2;
         return (rail, board);
     }

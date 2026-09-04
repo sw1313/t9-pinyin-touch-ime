@@ -25,6 +25,15 @@ public class OfficialT9ProfilePolicyTests
     public void Leftover_t9_threads_do_not_count_as_language_bar_selection()
     {
         Assert.False(OfficialT9ProfilePolicy.IsT9Layout(MicrosoftPinyin, Guid.Empty));
+        Assert.False(OfficialT9ProfilePolicy.IsCurrentSelection(
+            getActiveSucceeded: false,
+            isT9Layout: true));
+        Assert.True(OfficialT9ProfilePolicy.IsCurrentSelection(
+            getActiveSucceeded: true,
+            isT9Layout: true));
+        Assert.False(OfficialT9ProfilePolicy.IsCurrentSelection(
+            getActiveSucceeded: true,
+            isT9Layout: false));
     }
 
     [Fact]

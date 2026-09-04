@@ -24,6 +24,11 @@ internal partial class T9OverlayWindow
     private readonly AppSettings _settings;
     private readonly ForegroundTracker _foreground;
     private readonly List<T9Candidate> _candidates = [];
+    private readonly List<Button> _barButtons = [];
+    private readonly List<T9Candidate> _barCommit = [];
+    private bool _chromeBound;
+    private bool _rebuildKeysWhenIdle;
+    private bool _keyVisuallyPressed;
     private readonly DispatcherTimer _longPressTimer;
     private string _digits = "";
     private enum Board { Pinyin, Pinyin26, English, Full, Number, SymbolCn, SymbolEn }
@@ -61,7 +66,7 @@ internal partial class T9OverlayWindow
     private ScrollViewer? _railScroll;
     private bool _railSyllables;
     private readonly List<string> _symbolRecent = [];
-    private string? _selectedPinyin;
+    private readonly List<string> _confirmedSyllables = [];
     private ContentControl? _leftRail;
     private bool _movedByUser;
     private NativeRect _placeBeforeSymbol;
@@ -69,13 +74,46 @@ internal partial class T9OverlayWindow
     private bool _holdPlaceOnLayout;
     private bool _placingLayout;
     private bool _hosting;
+
+    public bool IsHosting => _hosting;
     private readonly List<HostHitRegion<Button>> _hostHitRegions = [];
     private readonly HostActionMap<Button> _hostTapActions = new();
     private readonly HostActionMap<Button> _hostPressActions = new();
+    private readonly Dictionary<Button, Func<bool>> _hostRepeats = [];
     private readonly HostPressGate _hostPressGate = new();
+    private readonly DispatcherTimer _keyRepeatTimer;
+    private Button? _keyRepeatButton;
+    private Action? _keyRepeatAction;
+    private Func<bool>? _keyRepeatGate;
     private bool _immediateTapFired;
     private Button? _pressedHostKey;
     private bool _holdHostFrame;
+
+    /// <summary>按下效果生效的时刻，用来保证它在屏上留够能看见的时间。</summary>
+    private DateTime _hostPressShownUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// 按下效果的最短可见时间。
+    ///
+    /// 触摸抬手往往不到 50ms，而按下动画本身就要 50ms，抬起一来动画立刻反向，
+    /// 于是"手感上按了、看上去没动"。鼠标按得久所以一直正常。系统浮层那条路更慢：
+    /// 用户看到的是位图，按下要经原生上报、线程池、命名管道再加一次 BeginInvoke
+    /// 才变成一帧，抬起常常先到。两条路都只推迟抬起的视觉，输入照旧立刻执行。
+    /// </summary>
+    private static readonly TimeSpan KeyPressMinVisible = TimeSpan.FromMilliseconds(90);
+
+    private readonly DispatcherTimer _hostPressRelease;
+
+    /// <summary>WPF 那条路上等着回弹的键，同上，为的是让按下看得见。</summary>
+    private readonly DispatcherTimer _keyReleaseTimer;
+    private Button? _keyReleasePending;
+    private DateTime _keyPressedUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// 长按已经替这颗键发过动作，抬起时就不该再补一次点击。
+    /// 原先靠共用的长按定时器还开着没开着来判断，快速连打时会张冠李戴。
+    /// </summary>
+    private Button? _longPressFired;
     private bool _dragging;
     private NativePoint _dragCursor;
     private NativePoint _dragWindow;
@@ -88,6 +126,10 @@ internal partial class T9OverlayWindow
     private Point? _swipeStart;
     private double _hostScaleX = 1;
     private double _hostScaleY = 1;
+    private double _hostLayoutW = KeyboardChromeSize.CompactWidth;
+    private double _hostLayoutH = KeyboardChromeSize.CompactHeight;
+    private int _hostFrameW;
+    private int _hostFrameH;
     private int _boardSlide;
     private int _activeAnimations;
     private DateTime _lastAnimationFrameUtc;
@@ -102,6 +144,18 @@ internal partial class T9OverlayWindow
         _foreground = foreground;
         _symbolLock = settings.SymbolLock;
         InitializeComponent();
+        _hostPressRelease = new DispatcherTimer();
+        _hostPressRelease.Tick += (_, _) => ReleaseHostPress();
+        _keyReleaseTimer = new DispatcherTimer();
+        _keyReleaseTimer.Tick += (_, _) =>
+        {
+            _keyReleaseTimer.Stop();
+            var pending = _keyReleasePending;
+            _keyReleasePending = null;
+            _keyVisuallyPressed = false;
+            TouchKeyVisual.Release(pending);
+            TryRebuildKeysWhenIdle();
+        };
         ImeHost.Shared.HostPress += OnHostPress;
         ImeHost.Shared.HostHit += OnHostHit;
         ImeHost.Shared.HostSwipe += OnHostSwipe;
@@ -138,11 +192,14 @@ internal partial class T9OverlayWindow
         FrameBorder.MouseLeave += OnSwipeMouseLeave;
         _longPressTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(480) };
         _longPressTimer.Tick += OnLongPress;
+        _keyRepeatTimer = new DispatcherTimer();
+        _keyRepeatTimer.Tick += OnKeyRepeat;
         Loaded += (_, _) =>
         {
             var hwnd = new WindowInteropHelper(this).Handle;
             _foreground.Ignore(hwnd);
             UiAccessBandHost.Shared.TryOwnAndRaise(hwnd);
+            BindChromeKeys();
             BuildKeys();
             RefreshChrome();
             ClipFrame();
@@ -159,6 +216,8 @@ internal partial class T9OverlayWindow
     public static double DesignWidth => KeyboardChromeSize.CompactWidth;
     public static double DesignHeight => KeyboardChromeSize.CompactHeight;
     private NativeRect _placed;
+
+    public NativeRect PlacedRect => _placed;
     private NativeRect _autoPlaced;
     private IntPtr _host;
     private IntPtr _owner;
@@ -205,6 +264,7 @@ internal partial class T9OverlayWindow
         var sameContext = KeyboardPositionSession.IsSameSurfaceContext(
             _context,
             context);
+        var shouldHost = ShellProcess.RequiresHostRender(host);
         var restart = KeyboardPinPolicy.ShouldRestart(
             IsPinned,
             !keepSessionPosition && KeyboardPositionSession.ShouldRestart(
@@ -213,9 +273,14 @@ internal partial class T9OverlayWindow
                 host,
                 _context,
                 context));
-        if (restart)
+        if (KeyboardPositionSession.ShouldTearDownBeforePlace(restart, shouldHost))
         {
             HideOverlay();
+            sameHost = false;
+            sameContext = false;
+        }
+        else if (restart)
+        {
             sameHost = false;
             sameContext = false;
         }
@@ -232,9 +297,7 @@ internal partial class T9OverlayWindow
         _context = context;
 
         PixelSize(out var width, out var height);
-        var shouldHost = ShellProcess.RequiresHostRender(host);
         var hwnd = new WindowInteropHelper(this).EnsureHandle();
-        SipLayer.Detach(hwnd);
         if (holdForSameLine)
         {
             rect = _placed;
@@ -263,26 +326,24 @@ internal partial class T9OverlayWindow
 
         rect.Right = rect.Left + width;
         rect.Bottom = rect.Top + height;
-        if (IsVisible && SameRect(rect, _placed) && shouldHost == _hosting)
+        if (IsVisible && !KeyboardPositionSession.ShouldMoveVisibleWindow(
+                SameRect(rect, _placed),
+                shouldHost != _hosting))
         {
-            if (shouldHost)
+            if (shouldHost
+                && HostFrame.NeedsRepublish(
+                    sameHost,
+                    sameContext,
+                    _hostReady))
             {
-                if (HostFrame.NeedsRepublish(
-                        sameHost,
-                        sameContext,
-                        _hostReady))
-                {
-                    PublishHost();
-                }
-            }
-            else
-            {
-                UiAccessBandHost.Shared.TryPlace(hwnd, _owner, rect);
+                PublishHost();
             }
 
             return;
         }
 
+        SipLayer.Detach(hwnd);
+        SipLayer.RaiseToIhmBand(hwnd);
         _placed = rect;
         var dpi = NativeMethods.GetDpiForWindow(hwnd);
         if (dpi == 0)
@@ -300,8 +361,8 @@ internal partial class T9OverlayWindow
             Left = rect.Left * 96.0 / dpi;
             Top = rect.Top * 96.0 / dpi;
         }
-        var flags = (uint)(NativeMethods.SwpNoActivate |
-            (shouldHost && _hostReady ? NativeMethods.SwpHideWindow : NativeMethods.SwpShowWindow));
+        var parkLocal = HostFrame.ShouldParkLocalWindow(shouldHost, _hostReady);
+        var flags = (uint)(NativeMethods.SwpNoActivate | NativeMethods.SwpShowWindow);
         var wasVisible = IsVisible;
         if (!wasVisible)
         {
@@ -317,8 +378,8 @@ internal partial class T9OverlayWindow
             NativeMethods.SetWindowPos(
                 hwnd,
                 NativeMethods.HwndTopmost,
-                rect.Left,
-                rect.Top,
+                parkLocal ? HostFrame.ParkOffset : rect.Left,
+                parkLocal ? HostFrame.ParkOffset : rect.Top,
                 width,
                 height,
                 flags);
@@ -410,6 +471,15 @@ internal partial class T9OverlayWindow
 
         var wasVisible = IsVisible;
         var wasHosting = _hosting;
+        _hostPressRelease.Stop();
+        _hostPressShownUtc = DateTime.MinValue;
+        _keyReleaseTimer.Stop();
+        _keyReleasePending = null;
+        _keyPressedUtc = DateTime.MinValue;
+        _keyVisuallyPressed = false;
+        _rebuildKeysWhenIdle = false;
+        StopKeyRepeat();
+        _longPressFired = null;
         _holdHostFrame = false;
         _pressedHostKey = null;
         _publishQueued = false;
@@ -668,6 +738,7 @@ internal partial class T9OverlayWindow
 
     private void OnSwipeTouchDown(object? sender, TouchEventArgs e)
     {
+        OverlayTouch.Note();
         var position = e.GetTouchPoint(FrameBorder).Position;
         _immediateTapFired = false;
         _swipeStart = position;
@@ -1396,8 +1467,10 @@ internal partial class T9OverlayWindow
             StopFallInertia();
             _fallTarget = null;
             BoardHost.Children.Clear();
+            StopKeyRepeat();
             _hostTapActions.Clear();
             _hostPressActions.Clear();
+            _hostRepeats.Clear();
             _hostPressGate.Reset();
             _immediateTapFired = false;
             _leftRail = null;
@@ -1434,6 +1507,8 @@ internal partial class T9OverlayWindow
             RefreshFunctionIcons();
             ApplyDesignSize();
             ApplyAppearance();
+            BindChromeKeys();
+            RebindCandidateHostActions();
 
             if (_candidatesExpanded && CandidateFallPolicy.CanExpand(ToSurface(_board)))
             {
@@ -1469,6 +1544,9 @@ internal partial class T9OverlayWindow
         }
         finally
         {
+            BoardHost?.InvalidateMeasure();
+            BoardHost?.InvalidateArrange();
+            FrameBorder?.InvalidateMeasure();
             RequestPublishHost();
         }
     }
@@ -1532,9 +1610,9 @@ internal partial class T9OverlayWindow
             return;
         }
 
-        // 没在输入时先钉住顶边改尺寸；有光标时由会话按输入位置重摆。
-        _placed.Right = _placed.Left + width;
-        _placed.Bottom = _placed.Top + height;
+        // 键盘贴在输入行上方。切盘钉住底边，只改高度，不要钉顶边再让
+        // 会话按 UIA 重摆——数字盘更高，钉顶会把底边压进输入行。
+        _placed = BoardPlaceResume.ResizePinnedBottom(_placed, width, height);
         var hwnd = new WindowInteropHelper(this).Handle;
         if (hwnd == IntPtr.Zero)
         {
@@ -1601,7 +1679,7 @@ internal partial class T9OverlayWindow
             tools.RowDefinitions.Add(new RowDefinition());
         }
 
-        AddTo(tools, MakeIconKey(KeyGlyphs.Backspace, OnBackspace, "退格"), 0, 0);
+        AddTo(tools, MakeIconKey(KeyGlyphs.Backspace, OnBackspace, "退格", repeatWhileHeld: true), 0, 0);
         AddTo(tools, MakeFunctionKey("清空", OnRetype, 14), 1, 0);
         AddTo(tools, MakeFunctionKey("符号", OnSymbolTray, 14), 2, 0);
         Grid.SetColumn(tools, 2);
@@ -1709,7 +1787,7 @@ internal partial class T9OverlayWindow
             tools.RowDefinitions.Add(new RowDefinition());
         }
 
-        AddTo(tools, MakeIconKey(KeyGlyphs.Backspace, OnBackspace, "退格"), 0, 0);
+        AddTo(tools, MakeIconKey(KeyGlyphs.Backspace, OnBackspace, "退格", repeatWhileHeld: true), 0, 0);
         AddTo(tools, MakeFunctionKey("清空", OnRetype, 14), 1, 0);
         AddTo(tools, MakeFunctionKey("符号", OnSymbolTray, 14), 2, 0);
         Grid.SetColumn(tools, 2);
@@ -1739,7 +1817,7 @@ internal partial class T9OverlayWindow
         if (_shift == TouchModifierPhase.Held)
         {
             _shift = TouchModifierPhase.Off;
-            BuildKeys();
+            RebuildKeysWhenIdle();
         }
     }
 
@@ -1768,9 +1846,9 @@ internal partial class T9OverlayWindow
         _letters += ch;
         _digits = T9Engine.ToDigits(_letters);
         _candidateBarOffset = 0;
-        _selectedPinyin = null;
+        ClearConfirmedSyllables();
         RefreshCandidates();
-        EmitCompose(PreviewPinyin());
+        PushComposition();
     }
 
     private Button MakePredictKey()
@@ -1795,6 +1873,7 @@ internal partial class T9OverlayWindow
 
     private IReadOnlyList<T9Candidate> QueryCurrent(int take = 120)
     {
+        using var scope = Perf.Begin("engine.query");
         if (_letters.Length > 0)
         {
             return EnglishPredictOn
@@ -1825,8 +1904,7 @@ internal partial class T9OverlayWindow
                 _board == Board.Full,
                 _latin,
                 _board == Board.Pinyin26)
-            && (_digits.Length > 0 || _letters.Length > 0)
-            && all.Count > 0;
+            && (_digits.Length > 0 || _letters.Length > 0);
         if (syllables != _railSyllables)
         {
             _railFallOffset = 0;
@@ -1835,13 +1913,8 @@ internal partial class T9OverlayWindow
 
         if (syllables)
         {
-            items = all
-                .Select(candidate => T9Engine.FirstSyllable(candidate.Pinyin))
-                .Where(pinyin => pinyin.Length > 0)
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
+            items = ResolveRailSyllables(all);
             tap = SelectPinyin;
-            selected = _selectedPinyin;
         }
         else
         {
@@ -1879,6 +1952,18 @@ internal partial class T9OverlayWindow
 
         _railScroll = MakeSlotViewer(buttons, width, height, slot, _railFallOffset);
         _leftRail.Content = _railScroll;
+    }
+
+    private IReadOnlyList<string> ResolveRailSyllables(IReadOnlyList<T9Candidate> all)
+    {
+        IReadOnlyList<string> items = _digits.Length > 0
+            ? _engine.QuerySyllables(_digits, _confirmedSyllables)
+            : _letters.Length > 0
+                ? _engine.QueryLetterSyllables(_letters, _confirmedSyllables)
+                : [];
+        return items.Count > 0
+            ? items
+            : SyllableSelectPolicy.Rail(all.Select(candidate => candidate.Pinyin), _confirmedSyllables);
     }
 
     private void BuildNumberBoard()
@@ -1926,7 +2011,7 @@ internal partial class T9OverlayWindow
     private void BuildSymbolBoard()
     {
         var (rail, board) = KeyboardChromeSize.SymbolColumns();
-        var stage = KeyboardChromeSize.CompactColumns().Board;
+        var stage = KeyboardChromeSize.CompactBoard;
         var root = new Grid { HorizontalAlignment = HorizontalAlignment.Center };
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(rail) });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(board) });
@@ -1970,7 +2055,9 @@ internal partial class T9OverlayWindow
 
     private void SelectPinyin(string pinyin)
     {
-        _selectedPinyin = CandidateFallPolicy.ToggleSyllable(_selectedPinyin, pinyin);
+        var next = SyllableSelectPolicy.Confirm(_confirmedSyllables, pinyin);
+        _confirmedSyllables.Clear();
+        _confirmedSyllables.AddRange(next);
         _candidateBarOffset = 0;
         _candidateFallOffset = 0;
         if (_candidatesExpanded)
@@ -2006,7 +2093,7 @@ internal partial class T9OverlayWindow
         root.Children.Add(_leftRail);
         RefreshLeftRail([]);
 
-        var all = FilterCandidates(QueryCurrent());
+        var all = FilterCandidates(QueryCurrent(CandidateBarSlots.FallQueryTake));
         var buttons = new List<Button>(all.Count);
         for (var index = 0; index < all.Count; index++)
         {
@@ -2085,7 +2172,7 @@ internal partial class T9OverlayWindow
         if (board != _board)
         {
             _railFallOffset = 0;
-            _selectedPinyin = null;
+            ClearConfirmedSyllables();
         }
 
         if (BoardNavigation.UpdatesHome(ToSurface(board)))
@@ -2155,9 +2242,10 @@ internal partial class T9OverlayWindow
         string title,
         Action tap,
         double fontSize = 16,
-        bool gestureRegion = false)
+        bool gestureRegion = false,
+        bool repeatWhileHeld = false)
     {
-        return MakeKey(title, tap, tap, fontSize, gestureRegion);
+        return MakeKey(title, tap, tap, fontSize, gestureRegion, repeatWhileHeld);
     }
 
     private Button MakeKey(
@@ -2165,7 +2253,8 @@ internal partial class T9OverlayWindow
         Action tap,
         Action longPress,
         double fontSize,
-        bool gestureRegion = false)
+        bool gestureRegion = false,
+        bool repeatWhileHeld = false)
     {
         var button = new Button
         {
@@ -2173,21 +2262,30 @@ internal partial class T9OverlayWindow
             Content = title,
             FontSize = fontSize
         };
-        BindTap(button, tap, longPress, title, gestureRegion);
+        BindTap(button, tap, longPress, title, gestureRegion, repeatWhileHeld);
         return button;
     }
 
-    private Button MakeFunctionKey(string title, Action tap, double fontSize)
+    private Button MakeFunctionKey(
+        string title,
+        Action tap,
+        double fontSize,
+        bool repeatWhileHeld = false)
     {
-        var button = MakeKey(title, tap, fontSize);
+        var button = MakeKey(title, tap, fontSize, repeatWhileHeld: repeatWhileHeld);
         button.Style = (Style)FindResource("FunctionKeyButton");
         return button;
     }
 
-    private Button MakeIconKey(Func<Brush, FrameworkElement> icon, Action tap, string title)
+    private Button MakeIconKey(
+        Func<Brush, FrameworkElement> icon,
+        Action tap,
+        string title,
+        bool repeatWhileHeld = false)
     {
-        var button = MakeFunctionKey(title, tap, T9KeyFace.FontSize);
+        var button = MakeFunctionKey(title, tap, T9KeyFace.FontSize, repeatWhileHeld);
         button.Content = icon(button.Foreground);
+        button.ToolTip = title;
         return button;
     }
 
@@ -2213,7 +2311,10 @@ internal partial class T9OverlayWindow
 
         if (EnterButton is not null)
         {
-            var backspace = ToolBarPolicy.BackspaceInsteadOfEnter(_numberPad, IsSymbolBoard);
+            var backspace = ToolBarPolicy.BackspaceInsteadOfEnter(
+                _numberPad,
+                IsSymbolBoard,
+                _candidatesExpanded);
             EnterButton.Content = backspace
                 ? KeyGlyphs.Backspace(EnterButton.Foreground)
                 : KeyGlyphs.Enter(EnterButton.Foreground);
@@ -2262,7 +2363,9 @@ internal partial class T9OverlayWindow
         Action tap,
         Action longPress,
         string title,
-        bool gestureRegion)
+        bool gestureRegion,
+        bool repeatWhileHeld = false,
+        Func<bool>? shouldRepeat = null)
     {
         var immediate = KeyTapTimingPolicy.IsImmediate(
             hasDistinctLongPress: !ReferenceEquals(tap, longPress),
@@ -2273,35 +2376,65 @@ internal partial class T9OverlayWindow
             _hostPressActions.Bind(button, tap);
         }
 
+        if (repeatWhileHeld)
+        {
+            _hostRepeats[button] = shouldRepeat ?? (() => true);
+        }
+
+        // 这一下按下是否还欠一次点击，由每颗键自己记。
+        // 早先读的是共用长按定时器的 IsEnabled，快速连打时后一颗键的按下会把它
+        // 重置、前一颗键的抬起又把它停掉，轮到后一颗键抬起就整个丢了，也就是吞字。
+        var owed = false;
+
         void Press()
         {
-            TouchKeyVisual.Press(button);
+            OverlayTouch.Note();
+            PressKeyVisual(button);
             _pendingDigit = title.Length == 1 ? title[0] : null;
             _longPressTimer.Stop();
             if (immediate)
             {
                 _immediateTapFired = true;
                 tap();
+                if (repeatWhileHeld && (shouldRepeat?.Invoke() ?? true))
+                {
+                    StartKeyRepeat(button, tap, shouldRepeat);
+                }
+
                 return;
             }
 
-            _longPressTimer.Tag = longPress;
+            owed = true;
+            _longPressTimer.Tag = (button, longPress);
             _longPressTimer.Start();
         }
 
         void Release()
         {
-            TouchKeyVisual.Release(button);
-            if (_immediateTapFired)
+            StopKeyRepeat(button);
+            ReleaseKeyVisualSoon(button);
+
+            // 用这颗键自己是不是「按下即触发」来判断，而不是 _immediateTapFired：
+            // 后者是留给翻页手势的全局标记，触摸被提升成鼠标事件时不一定清得掉。
+            if (immediate || !owed)
             {
                 return;
             }
 
-            if (_longPressTimer.IsEnabled)
+            owed = false;
+            if (ReferenceEquals(_longPressFired, button))
+            {
+                _longPressFired = null;
+                return;
+            }
+
+            if (_longPressTimer.Tag is ValueTuple<Button, Action> pending
+                && ReferenceEquals(pending.Item1, button))
             {
                 _longPressTimer.Stop();
-                tap();
             }
+
+            tap();
         }
 
         button.PreviewMouseLeftButtonDown += (_, e) =>
@@ -2326,13 +2459,91 @@ internal partial class T9OverlayWindow
         };
     }
 
+    private void StartKeyRepeat(Button button, Action tap, Func<bool>? gate)
+    {
+        _keyRepeatTimer.Stop();
+        _keyRepeatButton = button;
+        _keyRepeatAction = tap;
+        _keyRepeatGate = gate;
+        _keyRepeatTimer.Interval = KeyRepeatPolicy.InitialDelay;
+        _keyRepeatTimer.Start();
+    }
+
+    private void StopKeyRepeat(Button? button = null)
+    {
+        if (button is not null
+            && _keyRepeatButton is not null
+            && !ReferenceEquals(_keyRepeatButton, button))
+        {
+            return;
+        }
+
+        _keyRepeatTimer.Stop();
+        _keyRepeatButton = null;
+        _keyRepeatAction = null;
+        _keyRepeatGate = null;
+    }
+
+    private void OnKeyRepeat(object? sender, EventArgs e)
+    {
+        if (_keyRepeatAction is null
+            || (_keyRepeatGate is not null && !_keyRepeatGate()))
+        {
+            StopKeyRepeat();
+            return;
+        }
+
+        _keyRepeatAction();
+        _keyRepeatTimer.Interval = KeyRepeatPolicy.RepeatInterval;
+    }
+
     private void OnLongPress(object? sender, EventArgs e)
     {
         _longPressTimer.Stop();
-        if (_longPressTimer.Tag is Action action)
+        if (_longPressTimer.Tag is ValueTuple<Button, Action> entry)
         {
-            action();
+            _longPressFired = entry.Item1;
+            entry.Item2();
         }
+    }
+
+    private void PressKeyVisual(Button button)
+    {
+        // 上一颗键可能还在等最短可见时间，先收掉，免得两颗键同时是按下态。
+        if (_keyReleasePending is { } pending && !ReferenceEquals(pending, button))
+        {
+            TouchKeyVisual.Release(pending, animate: false);
+        }
+
+        _keyReleaseTimer.Stop();
+        _keyReleasePending = null;
+        _keyPressedUtc = DateTime.UtcNow;
+        _keyVisuallyPressed = true;
+        TouchKeyVisual.Press(button, animate: !KeyFeedbackPolicy.InstantPress);
+    }
+
+    /// <summary>
+    /// 等按下效果留够 <see cref="KeyPressMinVisible"/> 再回弹。
+    /// 触摸抬手比动画本身还快，直接回弹就等于没有按下反馈。
+    /// </summary>
+    private void ReleaseKeyVisualSoon(Button button)
+    {
+        var remaining = _keyPressedUtc == DateTime.MinValue
+            ? TimeSpan.Zero
+            : KeyPressMinVisible - (DateTime.UtcNow - _keyPressedUtc);
+        if (remaining <= TimeSpan.Zero)
+        {
+            _keyReleaseTimer.Stop();
+            _keyReleasePending = null;
+            _keyVisuallyPressed = false;
+            TouchKeyVisual.Release(button);
+            TryRebuildKeysWhenIdle();
+            return;
+        }
+
+        _keyReleasePending = button;
+        _keyReleaseTimer.Interval = remaining;
+        _keyReleaseTimer.Start();
     }
 
     private void OnSplit()
@@ -2405,9 +2616,9 @@ internal partial class T9OverlayWindow
         _letters = "";
         _digits += digit;
         _candidateBarOffset = 0;
-        _selectedPinyin = null;
+        ClearConfirmedSyllables();
         RefreshCandidates();
-        EmitCompose(PreviewPinyin());
+        PushComposition();
     }
 
     private void OnSpace()
@@ -2439,6 +2650,17 @@ internal partial class T9OverlayWindow
         using var scope = Perf.Begin("tap.backspace");
         if ((_digits.Length > 0 || _letters.Length > 0) && !_numberPad)
         {
+            if (_confirmedSyllables.Count > 0)
+            {
+                var popped = SyllableSelectPolicy.Pop(_confirmedSyllables);
+                _confirmedSyllables.Clear();
+                _confirmedSyllables.AddRange(popped);
+                _candidateBarOffset = 0;
+                RefreshCandidates();
+                PushComposition();
+                return;
+            }
+
             if (_letters.Length > 0)
             {
                 _letters = _letters[..^1];
@@ -2450,10 +2672,9 @@ internal partial class T9OverlayWindow
             }
 
             _candidateBarOffset = 0;
-            _selectedPinyin = null;
-            RefreshCandidates();
             if (_digits.Length == 0 && _letters.Length == 0)
             {
+                RefreshCandidates();
                 if (ImeHost.Shared.HasClient)
                 {
                     ImeHost.Shared.Cancel();
@@ -2461,7 +2682,8 @@ internal partial class T9OverlayWindow
                 return;
             }
 
-            EmitCompose(PreviewPinyin());
+            RefreshCandidates();
+            PushComposition();
             return;
         }
 
@@ -2525,7 +2747,7 @@ internal partial class T9OverlayWindow
 
         _publishQueued = true;
         Dispatcher.BeginInvoke(
-            DispatcherPriority.Render,
+            HostFrame.PublishPriority,
             new Action(() =>
             {
                 _publishQueued = false;
@@ -2547,14 +2769,14 @@ internal partial class T9OverlayWindow
 
         try
         {
-            var pixels = HostFrame.Capture(this, out var width, out var height);
+            HostFrame.FlushLayout(Dispatcher);
+            var pixels = CaptureHostFrame(out var width, out var height);
             if (pixels is null)
             {
                 Log.Warn("系统浮层帧捕获失败");
                 return;
             }
 
-            RebuildHostHitRegions(width, height);
             if (!ImeHost.Shared.ShowHost(
                     _placed,
                     pixels,
@@ -2570,6 +2792,52 @@ internal partial class T9OverlayWindow
         {
             Log.Warn($"系统浮层帧: {ex.Message}");
         }
+    }
+
+    private byte[]? CaptureHostFrame(out int width, out int height)
+    {
+        var pixels = HostFrame.Capture(this, out width, out height);
+        if (pixels is null)
+        {
+            return null;
+        }
+
+        RebuildHostHitRegions(width, height);
+        if (!HostHitMap.ShouldRetryAfterRebuild(
+                _hostHitRegions.Count,
+                CountExpectedHostButtons(FrameBorder)))
+        {
+            return pixels;
+        }
+
+        HostFrame.FlushLayout(Dispatcher);
+        pixels = HostFrame.Capture(this, out width, out height);
+        if (pixels is not null)
+        {
+            RebuildHostHitRegions(width, height);
+        }
+
+        return pixels;
+    }
+
+    private static int CountExpectedHostButtons(DependencyObject node)
+    {
+        var count = 0;
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(node); index++)
+        {
+            var child = VisualTreeHelper.GetChild(node, index);
+            if (child is Button button
+                && HostHitMap.CountsAsExpected(
+                    button.Visibility == Visibility.Visible,
+                    button.IsEnabled))
+            {
+                count++;
+            }
+
+            count += CountExpectedHostButtons(child);
+        }
+
+        return count;
     }
 
     private void OnHostVisibilityChanged(bool shown)
@@ -2593,14 +2861,13 @@ internal partial class T9OverlayWindow
                 NativeMethods.SetWindowPos(
                     hwnd,
                     IntPtr.Zero,
+                    HostFrame.ParkOffset,
+                    HostFrame.ParkOffset,
                     0,
                     0,
-                    0,
-                    0,
-                    NativeMethods.SwpNoMove |
                     NativeMethods.SwpNoSize |
                     NativeMethods.SwpNoActivate |
-                    NativeMethods.SwpHideWindow);
+                    NativeMethods.SwpShowWindow);
             }
             else
             {
@@ -2634,6 +2901,14 @@ internal partial class T9OverlayWindow
 
     private void BeginHostPress(Button button)
     {
+        // 上一颗键可能还在等最短可见时间。先收掉，否则定时器到点时会释放错对象，
+        // 快速连打就会留下一颗一直是按下态的键。
+        _hostPressRelease.Stop();
+        if (_pressedHostKey is { } previous && !ReferenceEquals(previous, button))
+        {
+            TouchKeyVisual.Release(previous, animate: false);
+        }
+
         _pressedHostKey = button;
         _holdHostFrame = true;
         TouchKeyVisual.Press(button, animate: false);
@@ -2642,10 +2917,14 @@ internal partial class T9OverlayWindow
             _publishQueued = false;
             PublishHost();
         }
+
+        _hostPressShownUtc = DateTime.UtcNow;
     }
 
     private void ReleaseHostPress()
     {
+        StopKeyRepeat(_pressedHostKey);
+        _hostPressRelease.Stop();
         var button = _pressedHostKey;
         if (button is null && !_holdHostFrame)
         {
@@ -2654,12 +2933,38 @@ internal partial class T9OverlayWindow
 
         _pressedHostKey = null;
         _holdHostFrame = false;
+        _hostPressShownUtc = DateTime.MinValue;
         TouchKeyVisual.Release(button, animate: false);
         if (_hosting)
         {
             _publishQueued = false;
             PublishHost();
         }
+
+        TryRebuildKeysWhenIdle();
+    }
+
+    /// <summary>
+    /// 等按下帧留够 <see cref="HostPressMinVisible"/> 再抬起。
+    /// 不能在这里同步等：UI 线程一停，按下帧本身也发不出去。
+    /// </summary>
+    private void ReleaseHostPressSoon()
+    {
+        if (_hostPressShownUtc == DateTime.MinValue)
+        {
+            ReleaseHostPress();
+            return;
+        }
+
+        var remaining = KeyPressMinVisible - (DateTime.UtcNow - _hostPressShownUtc);
+        if (remaining <= TimeSpan.Zero)
+        {
+            ReleaseHostPress();
+            return;
+        }
+
+        _hostPressRelease.Interval = remaining;
+        _hostPressRelease.Start();
     }
 
     /// <summary>
@@ -2670,8 +2975,9 @@ internal partial class T9OverlayWindow
     {
         Dispatcher.BeginInvoke(() =>
         {
+            OverlayTouch.Note();
             _hostPressGate.Reset();
-            var button = HostHitMap.Find(_hostHitRegions, x, y);
+            var button = ResolveHostButton(x, y, "按下");
             if (button is null)
             {
                 return;
@@ -2681,6 +2987,22 @@ internal partial class T9OverlayWindow
             if (_hostPressActions.TryInvoke(button))
             {
                 _hostPressGate.NotePressHandled();
+                if (_hostRepeats.TryGetValue(button, out var gate) && gate())
+                {
+                    StartKeyRepeat(
+                        button,
+                        () =>
+                        {
+                            if (!_hostRepeats.TryGetValue(button, out var live) || !live())
+                            {
+                                StopKeyRepeat(button);
+                                return;
+                            }
+
+                            _hostPressActions.TryInvoke(button);
+                        },
+                        gate);
+                }
             }
         });
     }
@@ -2691,22 +3013,34 @@ internal partial class T9OverlayWindow
         {
             if (_hostPressGate.ConsumeRelease())
             {
-                ReleaseHostPress();
+                ReleaseHostPressSoon();
                 return;
             }
 
-            ReleaseHostPress();
-            var button = HostHitMap.Find(_hostHitRegions, x, y);
+            var button = ResolveHostButton(x, y, "抬起");
             if (button is null)
             {
-                Log.Warn($"系统浮层点击未命中按钮 x={x} y={y}");
+                ReleaseHostPressSoon();
+                LogHostMiss(x, y);
                 return;
             }
 
+            // 抬起赶在按下之前到了，按下帧还没画出来，这一下就完全没有反馈。
+            // 补一帧按下再往下走。
+            if (_pressedHostKey is null)
+            {
+                BeginHostPress(button);
+            }
+
+            // 解除帧合并：下面刷候选时要能照常发帧，否则候选要等到抬起才更新。
+            // 按键仍是按下态，所以这一帧里既有按下效果也有新候选。
+            _holdHostFrame = false;
             if (!_hostTapActions.TryInvoke(button))
             {
                 button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             }
+
+            ReleaseHostPressSoon();
         });
     }
 
@@ -2716,7 +3050,7 @@ internal partial class T9OverlayWindow
         {
             if (_hostPressGate.ConsumeRelease())
             {
-                ReleaseHostPress();
+                ReleaseHostPressSoon();
                 return;
             }
 
@@ -2760,27 +3094,101 @@ internal partial class T9OverlayWindow
         });
     }
 
+    private Button? ResolveHostButton(int x, int y, string source)
+    {
+        var button = HostHitMap.FindLayout(
+            _hostHitRegions,
+            x,
+            y,
+            _hostLayoutW,
+            _hostLayoutH,
+            _hostFrameW,
+            _hostFrameH,
+            out var space);
+        if (button is not null)
+        {
+            Log.Info(
+                $"系统浮层{source} 命中 {HostKeyLabel(button)} x={x} y={y} 空间={space} "
+                + $"layout={_hostLayoutW:0}x{_hostLayoutH:0} frame={_hostFrameW}x{_hostFrameH}");
+        }
+
+        return button;
+    }
+
+    private static string HostKeyLabel(Button button) =>
+        button.ToolTip as string
+            ?? button.Content as string
+            ?? (string.IsNullOrEmpty(button.Name) ? "?" : button.Name);
+
+    private void LogHostMiss(int x, int y)
+    {
+        var mapped = HostHitMap.MapClientToFrame(
+            x,
+            y,
+            _hostFrameW,
+            _hostFrameH,
+            (int)Math.Round(_hostLayoutW),
+            (int)Math.Round(_hostLayoutH));
+        var box = HostHitMap.UnionBounds(_hostHitRegions);
+        Log.Warn(
+            $"系统浮层点击未命中按钮 x={x} y={y} keys={_hostHitRegions.Count} "
+            + $"layout={_hostLayoutW:0}x{_hostLayoutH:0} frame={_hostFrameW}x{_hostFrameH} "
+            + $"mapped=({mapped.X},{mapped.Y}) "
+            + $"keysBox={box.Left:0},{box.Top:0}-{box.Right:0},{box.Bottom:0}");
+    }
+
     private void RebuildHostHitRegions(int pixelWidth, int pixelHeight)
     {
-        _hostHitRegions.Clear();
         if (FrameBorder.ActualWidth <= 0 || FrameBorder.ActualHeight <= 0)
         {
             return;
         }
 
-        var scaleX = pixelWidth / FrameBorder.ActualWidth;
-        var scaleY = pixelHeight / FrameBorder.ActualHeight;
-        _hostScaleX = scaleX;
-        _hostScaleY = scaleY;
-        CollectHostButtons(FrameBorder, scaleX, scaleY);
+        _hostFrameW = pixelWidth;
+        _hostFrameH = pixelHeight;
+        if (!HostHitMap.IsLayoutCollapsed(FrameBorder.ActualHeight, Height))
+        {
+            _hostLayoutW = FrameBorder.ActualWidth;
+            _hostLayoutH = FrameBorder.ActualHeight;
+        }
+
+        _hostScaleX = _hostLayoutW > 0 ? _hostFrameW / _hostLayoutW : 1;
+        _hostScaleY = _hostLayoutH > 0 ? _hostFrameH / _hostLayoutH : 1;
+        var next = new List<HostHitRegion<Button>>();
+        CollectHostButtons(FrameBorder, next);
+        var maxBottom = 0.0;
+        for (var index = 0; index < next.Count; index++)
+        {
+            if (next[index].Bottom > maxBottom)
+            {
+                maxBottom = next[index].Bottom;
+            }
+        }
+
+        var covers = !HostHitMap.IsLayoutCollapsed(FrameBorder.ActualHeight, Height)
+            && HostHitMap.CoversFrameHeight(maxBottom, _hostLayoutH);
+        if (!HostHitMap.ShouldReplaceRegions(next.Count, _hostHitRegions.Count, covers))
+        {
+            return;
+        }
+
+        _hostHitRegions.Clear();
+        _hostHitRegions.AddRange(next);
     }
 
-    private void CollectHostButtons(DependencyObject node, double scaleX, double scaleY)
+    private void CollectHostButtons(
+        DependencyObject node,
+        List<HostHitRegion<Button>> regions)
     {
         for (var index = 0; index < VisualTreeHelper.GetChildrenCount(node); index++)
         {
             var child = VisualTreeHelper.GetChild(node, index);
-            if (child is Button button && button.IsVisible && button.IsEnabled)
+            if (child is Button button
+                && HostHitMap.ShouldCollect(
+                    button.Visibility == Visibility.Visible,
+                    button.IsEnabled,
+                    button.RenderSize.Width,
+                    button.RenderSize.Height))
             {
                 try
                 {
@@ -2791,15 +3199,16 @@ internal partial class T9OverlayWindow
                         bounds.Intersect(clip);
                         if (bounds.IsEmpty || bounds.Width < 2 || bounds.Height < 2)
                         {
+                            CollectHostButtons(child, regions);
                             continue;
                         }
                     }
 
-                    _hostHitRegions.Add(new HostHitRegion<Button>(
-                        bounds.Left * scaleX,
-                        bounds.Top * scaleY,
-                        bounds.Right * scaleX,
-                        bounds.Bottom * scaleY,
+                    regions.Add(new HostHitRegion<Button>(
+                        bounds.Left,
+                        bounds.Top,
+                        bounds.Right,
+                        bounds.Bottom,
                         button));
                 }
                 catch (InvalidOperationException)
@@ -2808,68 +3217,42 @@ internal partial class T9OverlayWindow
                 }
             }
 
-            CollectHostButtons(child, scaleX, scaleY);
+            CollectHostButtons(child, regions);
         }
     }
 
     private void RefreshCandidates()
     {
+        using var scope = Perf.Begin("candidates.refresh");
         try
         {
-        var preview = _selectedPinyin ?? PreviewPinyin();
-        CodeText.Text = string.IsNullOrEmpty(preview)
-            ? (_board == Board.English || (_board == Board.Full && _latin)
-                ? (EnglishPredictOn && _letters.Length > 0 ? _letters : "EN")
-                : "拼音")
-            : preview;
-        CandidatePanel.Children.Clear();
         _candidates.Clear();
         if ((_digits.Length == 0 && _letters.Length == 0)
             || _numberPad
             || (_english && !EnglishPredictOn))
         {
+            PaintCodeText("");
             _candidatesExpanded = false;
             _candidateFallOffset = 0;
             _candidateBarOffset = 0;
             HideCandidateMore();
+            PaintCandidateBar([]);
             RefreshLeftRail([]);
             return;
         }
 
-        var unfiltered = QueryCurrent();
+        var unfiltered = QueryCurrent(CandidateBarSlots.QueryTake(_candidatesExpanded));
+        if (!KeyFeedbackPolicy.ComposeBeforeCandidates)
+        {
+            PaintCodeText(SyllableSelectPolicy.Display(_confirmedSyllables, PreviewPinyin()));
+        }
+
         RefreshLeftRail(unfiltered);
         var all = FilterCandidates(unfiltered);
-        if (all.Count == 0)
-        {
-            HideCandidateMore();
-            return;
-        }
-
         _candidates.AddRange(all);
-        for (var index = 0; index < _candidates.Count; index++)
-        {
-            var candidate = _candidates[index];
-            var word = candidate.Word;
-            var button = new Button
-            {
-                Content = word,
-                Style = (Style)FindResource("CandidateButton")
-            };
-            if (index == 0)
-            {
-                button.Background = (Brush)FindResource("AccentSoftBrush");
-                button.Foreground = (Brush)FindResource("AccentBrush");
-                button.FontWeight = FontWeights.SemiBold;
-            }
-
-            BindTap(
-                button,
-                () => Commit(candidate),
-                () => Commit(candidate),
-                word,
-                gestureRegion: true);
-            CandidatePanel.Children.Add(button);
-        }
+        var shown = CandidateBarSlots.PaintCount(all.Count, expanded: false);
+        PaintCandidateBar(shown == all.Count ? all : all.Take(shown).ToArray());
+        ShowCandidateMore(CandidateBarSlots.ShowsMore(unfiltered.Count) || CandidateBarSlots.ShowsMore(all.Count));
 
         if (CandidateScroller is not null)
         {
@@ -2880,13 +3263,266 @@ internal partial class T9OverlayWindow
                 CandidateScroller.ViewportWidth);
             CandidateScroller.ScrollToHorizontalOffset(_candidateBarOffset);
         }
-
-        ShowCandidateMore(all.Count > 0);
         }
         finally
         {
             RequestPublishHost();
         }
+    }
+
+    private void PushComposition()
+    {
+        var preview = PreviewPinyin();
+        PaintCodeText(SyllableSelectPolicy.Display(_confirmedSyllables, preview));
+        EmitCompose(preview);
+        if (_hosting)
+        {
+            ImeHost.Shared.OfferSearchCandidates(
+                SearchCandidatePayload.Encode(
+                    preview,
+                    _candidates.Select(candidate => candidate.Word)));
+        }
+    }
+
+    private void PaintCodeText(string preview)
+    {
+        if (CodeText is null)
+        {
+            return;
+        }
+
+        CodeText.Text = string.IsNullOrEmpty(preview)
+            ? (_board == Board.English || (_board == Board.Full && _latin)
+                ? (EnglishPredictOn && _letters.Length > 0 ? _letters : "EN")
+                : "拼音")
+            : preview;
+    }
+
+    private void EnsureBarButtons()
+    {
+        if (CandidatePanel is null)
+        {
+            return;
+        }
+
+        while (_barButtons.Count < CandidateBarSlots.Visible)
+        {
+            var slot = _barButtons.Count;
+            var button = new Button
+            {
+                Style = (Style)FindResource("CandidateButton"),
+                Visibility = Visibility.Collapsed
+            };
+            BindTap(button, () => CommitBar(slot), () => CommitBar(slot), "", gestureRegion: true);
+            _barButtons.Add(button);
+            CandidatePanel.Children.Add(button);
+        }
+    }
+
+    private void PaintCandidateBar(IReadOnlyList<T9Candidate> items)
+    {
+        EnsureBarButtons();
+        _barCommit.Clear();
+        _barCommit.AddRange(items);
+        var accent = (Brush)FindResource("AccentSoftBrush");
+        var accentText = (Brush)FindResource("AccentBrush");
+        var text = (Brush)FindResource("TextBrush");
+        for (var i = 0; i < _barButtons.Count; i++)
+        {
+            var button = _barButtons[i];
+            if (i >= items.Count)
+            {
+                button.Visibility = Visibility.Collapsed;
+                button.Content = null;
+                button.ToolTip = null;
+                HostHitMap.RemoveTarget(_hostHitRegions, button);
+                continue;
+            }
+
+            button.Visibility = Visibility.Visible;
+            button.Content = items[i].Word;
+            button.ToolTip = items[i].Word;
+            if (i == 0)
+            {
+                button.Background = accent;
+                button.Foreground = accentText;
+                button.FontWeight = FontWeights.SemiBold;
+            }
+            else
+            {
+                button.ClearValue(BackgroundProperty);
+                button.Foreground = text;
+                button.FontWeight = FontWeights.Normal;
+            }
+        }
+
+        RebindCandidateHostActions();
+        RefreshHostCandidateHits();
+    }
+
+    private void RebindCandidateHostActions()
+    {
+        for (var index = 0; index < _barButtons.Count; index++)
+        {
+            var slot = index;
+            _hostTapActions.Bind(_barButtons[index], () => CommitBar(slot));
+            _hostPressActions.Bind(_barButtons[index], () => CommitBar(slot));
+        }
+
+        if (CandidateMore is null)
+        {
+            return;
+        }
+
+        void More() => OnCandidateMore(CandidateMore, new RoutedEventArgs());
+        _hostTapActions.Bind(CandidateMore, More);
+        _hostPressActions.Bind(CandidateMore, More);
+    }
+
+    private void RefreshHostCandidateHits()
+    {
+        if (FrameBorder is null || _hostHitRegions.Count == 0)
+        {
+            return;
+        }
+
+        var incoming = new List<HostHitRegion<Button>>();
+        CollectCandidateHits(incoming);
+        HostHitMap.Upsert(_hostHitRegions, incoming);
+    }
+
+    private void CollectCandidateHits(List<HostHitRegion<Button>> regions)
+    {
+        foreach (var button in _barButtons)
+        {
+            TryAddHostHit(button, regions);
+        }
+
+        TryAddHostHit(CandidateMore, regions);
+    }
+
+    private void TryAddHostHit(Button? button, List<HostHitRegion<Button>> regions)
+    {
+        if (button is null
+            || !HostHitMap.ShouldCollect(
+                button.Visibility == Visibility.Visible,
+                button.IsEnabled,
+                button.RenderSize.Width,
+                button.RenderSize.Height))
+        {
+            return;
+        }
+
+        try
+        {
+            var bounds = button.TransformToAncestor(FrameBorder)
+                .TransformBounds(new Rect(button.RenderSize));
+            if (TryClipToScrollViewer(button, out var clip))
+            {
+                bounds.Intersect(clip);
+                if (bounds.IsEmpty || bounds.Width < 2 || bounds.Height < 2)
+                {
+                    return;
+                }
+            }
+
+            regions.Add(new HostHitRegion<Button>(
+                bounds.Left,
+                bounds.Top,
+                bounds.Right,
+                bounds.Bottom,
+                button));
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    private void CommitBar(int slot)
+    {
+        if ((uint)slot < (uint)_barCommit.Count)
+        {
+            Commit(_barCommit[slot]);
+        }
+    }
+
+    private void RebuildKeysWhenIdle()
+    {
+        _rebuildKeysWhenIdle = true;
+        TryRebuildKeysWhenIdle();
+    }
+
+    private void TryRebuildKeysWhenIdle()
+    {
+        if (!_rebuildKeysWhenIdle)
+        {
+            return;
+        }
+
+        if (!KeyFeedbackPolicy.CanRebuildFaces(
+                _pressedHostKey is not null,
+                _keyVisuallyPressed || _keyReleasePending is not null))
+        {
+            return;
+        }
+
+        _rebuildKeysWhenIdle = false;
+        BuildKeys();
+    }
+
+    private void BindChromeKeys()
+    {
+        void Map(Button? button, Action tap, Func<bool>? repeat = null)
+        {
+            if (button is null)
+            {
+                return;
+            }
+
+            _hostTapActions.Bind(button, tap);
+            _hostPressActions.Bind(button, tap);
+            if (repeat is not null)
+            {
+                _hostRepeats[button] = repeat;
+            }
+
+            if (_chromeBound)
+            {
+                return;
+            }
+
+            BindTap(
+                button,
+                tap,
+                tap,
+                button.Name ?? "",
+                gestureRegion: false,
+                repeatWhileHeld: repeat is not null,
+                shouldRepeat: repeat);
+        }
+
+        Map(LangButton, () => OnModeClicked(LangButton!, new RoutedEventArgs()));
+        Map(SpaceButton, OnSpace);
+        Map(DigitButton, () => OnDigitModeClicked(DigitButton!, new RoutedEventArgs()));
+        Map(
+            EnterButton,
+            OnEnterTap,
+            () => ToolBarPolicy.BackspaceInsteadOfEnter(
+                _numberPad,
+                IsSymbolBoard,
+                _candidatesExpanded));
+        _chromeBound = true;
+    }
+
+    private void OnEnterTap()
+    {
+        if (ToolBarPolicy.BackspaceInsteadOfEnter(_numberPad, IsSymbolBoard, _candidatesExpanded))
+        {
+            OnBackspace();
+            return;
+        }
+
+        OnEnter();
     }
 
     private void HideCandidateMore() => ShowCandidateMore(false);
@@ -2912,24 +3548,76 @@ internal partial class T9OverlayWindow
 
     private IReadOnlyList<T9Candidate> FilterCandidates(IReadOnlyList<T9Candidate> candidates)
     {
-        if (string.IsNullOrEmpty(_selectedPinyin))
+        if (_confirmedSyllables.Count == 0)
         {
             return candidates;
         }
 
         return candidates
-            .Where(candidate => string.Equals(
-                T9Engine.FirstSyllable(candidate.Pinyin),
-                _selectedPinyin,
-                StringComparison.Ordinal))
+            .Where(candidate => SyllableSelectPolicy.Matches(candidate.Pinyin, _confirmedSyllables))
             .ToArray();
     }
 
     private void Commit(T9Candidate candidate)
     {
         SendText(candidate.Word);
+        if (ContinueRemainder(candidate))
+        {
+            return;
+        }
+
         ResetComposition();
     }
+
+    private bool ContinueRemainder(T9Candidate candidate)
+    {
+        if (_letters.Length > 0)
+        {
+            var typed = T9Engine.CompactLetters(_letters);
+            var consumed = CompositionConsumePolicy.ConsumeLetters(
+                candidate.MatchKind,
+                candidate.Pinyin,
+                typed);
+            if (!CompositionConsumePolicy.HasRemainder(consumed, typed.Length))
+            {
+                return false;
+            }
+
+            _letters = typed[consumed..];
+            _digits = T9Engine.ToDigits(_letters);
+        }
+        else
+        {
+            var consumed = CompositionConsumePolicy.ConsumeDigits(
+                candidate.MatchKind,
+                candidate.Pinyin,
+                _digits);
+            if (!CompositionConsumePolicy.HasRemainder(consumed, _digits.Length))
+            {
+                return false;
+            }
+
+            _digits = _digits[consumed..];
+        }
+
+        ClearConfirmedSyllables();
+        _candidateBarOffset = 0;
+        _candidateFallOffset = 0;
+        if (_candidatesExpanded)
+        {
+            RefreshChrome();
+        }
+        else
+        {
+            RefreshCandidates();
+        }
+
+        PushComposition();
+
+        return true;
+    }
+
+    private void ClearConfirmedSyllables() => _confirmedSyllables.Clear();
 
     private void ResetComposition()
     {
@@ -2938,7 +3626,7 @@ internal partial class T9OverlayWindow
         _letters = "";
         _candidateBarOffset = 0;
         _railFallOffset = 0;
-        _selectedPinyin = null;
+        ClearConfirmedSyllables();
         _candidatesExpanded = false;
         _candidateFallOffset = 0;
         _candidates.Clear();
@@ -2962,7 +3650,7 @@ internal partial class T9OverlayWindow
 
     private void OnEnterClicked(object sender, RoutedEventArgs e)
     {
-        if (ToolBarPolicy.BackspaceInsteadOfEnter(_numberPad, IsSymbolBoard))
+        if (ToolBarPolicy.BackspaceInsteadOfEnter(_numberPad, IsSymbolBoard, _candidatesExpanded))
         {
             OnBackspace();
             return;
@@ -3187,15 +3875,9 @@ internal partial class T9OverlayWindow
 
     private void EmitCompose(string text)
     {
-        if (ShellProcess.IsForegroundFlyout())
-        {
-            return;
-        }
-
-        if (ImeHost.Shared.CanCommitForeground())
-        {
-            ImeHost.Shared.Compose(text);
-        }
+        // 官方搜索 IME 把组合写进文档。以前前台是 SearchHost/开始菜单就直接
+        // return，HostRender 键会亮、搜索框却永远是空的。
+        ImeHost.Shared.Compose(text);
     }
 
     /// <summary>

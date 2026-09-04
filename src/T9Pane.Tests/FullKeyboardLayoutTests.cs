@@ -50,6 +50,7 @@ public class FullKeyboardLayoutTests
         Assert.Equal("q", EnglishKeyboardLayout.Face("q", shift: false));
         var unit = KeyboardChromeSize.EnglishLetterUnit;
         Assert.True(unit >= 56);
+        Assert.Equal(63.6 * KeyboardChromeSize.PadScale, unit, 3);
         Assert.Equal(unit * 10, KeyboardChromeSize.EnglishColumns().Board, 3);
         Assert.Equal(unit * 3, KeyboardChromeSize.EnglishBoardHeight, 3);
         Assert.Equal(unit, KeyboardChromeSize.EnglishBoardHeight / 3, 3);
@@ -184,6 +185,14 @@ public class FullKeyboardLayoutTests
         Assert.True(BoardPlaceResume.ShouldKeepPlace(
             KeyboardSurface.Pinyin,
             KeyboardSurface.Pinyin));
+        var resized = BoardPlaceResume.ResizePinnedBottom(
+            new NativeRect { Left = 100, Top = 200, Right = 500, Bottom = 560 },
+            400,
+            300);
+        Assert.Equal(100, resized.Left);
+        Assert.Equal(260, resized.Top);
+        Assert.Equal(500, resized.Right);
+        Assert.Equal(560, resized.Bottom);
         Assert.False(BoardPlaceResume.ShouldKeepPlace(
             KeyboardSurface.English,
             KeyboardSurface.Pinyin));
@@ -259,6 +268,17 @@ public class FullKeyboardLayoutTests
         Assert.Equal("mi", CandidateFallPolicy.ToggleSyllable("ni", "mi"));
         Assert.True(CandidateFallPolicy.RebuildHomeAfterCommit(true));
         Assert.False(CandidateFallPolicy.RebuildHomeAfterCommit(false));
+        Assert.Equal(16, CandidateBarSlots.QueryTake(expanded: false));
+        Assert.Equal(120, CandidateBarSlots.QueryTake(expanded: true));
+        Assert.Equal(10, CandidateBarSlots.PaintCount(80, expanded: false));
+        Assert.Equal(80, CandidateBarSlots.PaintCount(80, expanded: true));
+        Assert.True(CandidateBarSlots.ShowsMore(11));
+        Assert.False(CandidateBarSlots.ShowsMore(10));
+        Assert.True(KeyFeedbackPolicy.InstantPress);
+        Assert.True(KeyFeedbackPolicy.ComposeBeforeCandidates);
+        Assert.False(KeyFeedbackPolicy.CanRebuildFaces(hostPressed: true, localPressed: false));
+        Assert.False(KeyFeedbackPolicy.CanRebuildFaces(hostPressed: false, localPressed: true));
+        Assert.True(KeyFeedbackPolicy.CanRebuildFaces(hostPressed: false, localPressed: false));
     }
 
     [Fact]
@@ -347,6 +367,7 @@ public class FullKeyboardLayoutTests
     [Theory]
     [InlineData("ni hao", "nihao", "全拼")]
     [InlineData("ni hao", "ni", "全拼前缀")]
+    [InlineData("ni", "nihao", "组词")]
     [InlineData("ni hao", "nh", "简拼")]
     [InlineData("ni hao", "wo", null)]
     public void Letter_match_prefers_full_pinyin_over_initials(string pinyin, string typed, string? kind)
@@ -593,6 +614,7 @@ public class FullKeyboardLayoutTests
         var full = KeyboardChromeSize.ForBoard(true);
         Assert.True(compact.Width < english.Width);
         Assert.True(english.Width < full.Width);
+        Assert.True(compact.Width < full.Width);
         Assert.Equal(KeyboardChromeSize.CompactWidth, compact.Width);
         Assert.Equal(KeyboardChromeSize.EnglishWidth, english.Width);
         Assert.Equal(KeyboardChromeSize.EnglishHeight, english.Height);
@@ -630,7 +652,7 @@ public class FullKeyboardLayoutTests
     }
 
     [Fact]
-    public void Number_pad_uses_the_same_square_unit_as_t9()
+    public void Number_pad_keeps_the_unscaled_square_unit()
     {
         Assert.Equal(12, NumberPadLayout.Keys.Length);
         Assert.Equal("X", NumberPadLayout.Keys[9]);
@@ -639,12 +661,13 @@ public class FullKeyboardLayoutTests
         Assert.True(ToolBarPolicy.BackspaceInsteadOfEnter(true, false));
         Assert.True(ToolBarPolicy.BackspaceInsteadOfEnter(false, true));
         Assert.False(ToolBarPolicy.BackspaceInsteadOfEnter(false, false));
-        var t9 = KeyboardChromeSize.CompactColumns().Board / 3;
-        Assert.Equal(t9, KeyboardChromeSize.CompactUnit, 3);
+        Assert.True(ToolBarPolicy.BackspaceInsteadOfEnter(false, false, candidatesExpanded: true));
+        Assert.Equal(KeyboardChromeSize.CompactBoard / 3, KeyboardChromeSize.CompactUnit, 3);
         Assert.Equal(
-            t9 * KeyboardChromeSize.NumberColumns,
+            KeyboardChromeSize.T9Board,
             KeyboardChromeSize.CompactColumns().Board,
             3);
+        Assert.True(KeyboardChromeSize.T9Board > KeyboardChromeSize.CompactBoard);
     }
 
     [Fact]

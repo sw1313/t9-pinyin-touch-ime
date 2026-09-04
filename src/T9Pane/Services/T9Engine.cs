@@ -22,10 +22,19 @@ internal sealed class T9Entry
 
 internal sealed class T9Engine
 {
+    private const int PrefixWordsPerSyllable = 80;
+    private const int JianpinLimit = 150;
+    private const int ComposeTailLimit = 8;
+
     private readonly List<T9Entry> _entries = [];
-    private readonly Dictionary<string, List<int>> _prefixIndex = new(StringComparer.Ordinal);
+    private readonly T9SyllableTable _syllables = new();
+    private readonly Dictionary<string, List<int>> _exactFull = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<int>> _byFirstSyllable = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<int>> _initialPrefix = new(StringComparer.Ordinal);
     private readonly List<T9Entry> _latinEntries = [];
     private readonly Dictionary<string, List<int>> _latinPrefixIndex = new(StringComparer.Ordinal);
+    private string _rankedKey = "";
+    private IReadOnlyList<T9Candidate> _ranked = [];
     private static readonly Dictionary<char, char> LetterMap = new()
     {
         ['a'] = '2', ['b'] = '2', ['c'] = '2',
@@ -44,9 +53,14 @@ internal sealed class T9Engine
     public void Load(ImeCatalog catalog, IEnumerable<string>? extraRoots = null)
     {
         _entries.Clear();
-        _prefixIndex.Clear();
+        _syllables.Clear();
+        _exactFull.Clear();
+        _byFirstSyllable.Clear();
+        _initialPrefix.Clear();
         _latinEntries.Clear();
         _latinPrefixIndex.Clear();
+        _rankedKey = "";
+        _ranked = [];
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var loadedFiles = new List<string>();
         var queue = new Queue<string>();
@@ -95,7 +109,7 @@ internal sealed class T9Engine
         BuildLatinIndex();
         SourceDescription = loadedFiles.Count == 0
             ? "未找到小白T9 词库。请确认 Data\\xiaobai-t9 已随程序复制。"
-            : $"已加载小白T9 开源词库 {loadedFiles.Count} 个文件，{_entries.Count} 条，英文 {_latinEntries.Count} 条";
+            : $"已加载小白T9 开源词库 {loadedFiles.Count} 个文件，{_entries.Count} 条，合法音节 {_syllables.Count} 个，英文 {_latinEntries.Count} 条";
         Log.Info(SourceDescription);
     }
 
@@ -106,16 +120,30 @@ internal sealed class T9Engine
             return [];
         }
 
+        return Ranked($"9\n{digits}", digits.Length, take, () => CollectDigits(digits));
+    }
+
+    public IReadOnlyList<string> QuerySyllables(string digits, IReadOnlyList<string>? confirmed = null)
+    {
+        return _syllables.MatchCurrent(T9SyllableTable.RemainingDigits(digits, confirmed));
+    }
+
+    public IReadOnlyList<string> QueryLetterSyllables(string letters, IReadOnlyList<string>? confirmed = null)
+    {
+        return _syllables.MatchCurrentLetters(T9SyllableTable.RemainingLetters(letters, confirmed));
+    }
+
+    private List<T9Candidate> CollectDigits(string digits)
+    {
         var hits = new List<T9Candidate>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var heads = new List<T9Entry>();
-        foreach (var index in CandidateIndexes(digits))
+
+        void Add(T9Entry entry, string kind)
         {
-            var entry = _entries[index];
-            var kind = T9DigitMatch.Classify(entry.FullDigits, entry.InitialDigits, digits);
-            if (kind is null || !seen.Add(entry.Word))
+            if (!seen.Add(entry.Word))
             {
-                continue;
+                return;
             }
 
             hits.Add(new T9Candidate
@@ -131,6 +159,73 @@ internal sealed class T9Engine
             }
         }
 
+        if (_exactFull.TryGetValue(digits, out var exact))
+        {
+            foreach (var index in exact)
+            {
+                Add(_entries[index], "全拼");
+            }
+        }
+
+        for (var length = 2; length < digits.Length; length++)
+        {
+            if (!_exactFull.TryGetValue(digits[..length], out var prefixes))
+            {
+                continue;
+            }
+
+            foreach (var index in prefixes)
+            {
+                Add(_entries[index], "组词");
+            }
+        }
+
+        foreach (var syllable in _syllables.MatchForWords(digits))
+        {
+            if (!_byFirstSyllable.TryGetValue(syllable, out var bucket))
+            {
+                continue;
+            }
+
+            var taken = 0;
+            foreach (var index in bucket)
+            {
+                var entry = _entries[index];
+                if (entry.FullDigits.Length <= digits.Length
+                    || !entry.FullDigits.StartsWith(digits, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                Add(entry, "全拼前缀");
+                if (++taken >= PrefixWordsPerSyllable)
+                {
+                    break;
+                }
+            }
+        }
+
+        var initialKey = digits.Length >= 2 ? digits[..2] : digits;
+        if (_initialPrefix.TryGetValue(initialKey, out var initials))
+        {
+            var taken = 0;
+            foreach (var index in initials)
+            {
+                var entry = _entries[index];
+                var kind = T9DigitMatch.Classify(entry.FullDigits, entry.InitialDigits, digits);
+                if (kind is not ("简拼" or "简拼前缀" or "简拼组词"))
+                {
+                    continue;
+                }
+
+                Add(entry, kind);
+                if (++taken >= JianpinLimit)
+                {
+                    break;
+                }
+            }
+        }
+
         foreach (var composed in ComposePhrases(digits, heads))
         {
             if (seen.Add(composed.Word))
@@ -139,7 +234,40 @@ internal sealed class T9Engine
             }
         }
 
-        return T9MatchRank.Order(hits, digits.Length, take);
+        return hits;
+    }
+
+    /// <summary>
+    /// 一次按键会连着查三遍同一串码：主候选一次，拼音预览栏两次。
+    ///
+    /// Order 只是全排序后截断，所以小 take 的结果就是大 take 结果的前缀。
+    /// 这里按码记住一份完整排序结果，后两次直接切片，省掉两次全量扫描——
+    /// 词库大或索引未命中时那两次各自都要扫一遍 _entries。
+    /// </summary>
+    private IReadOnlyList<T9Candidate> Ranked(
+        string key,
+        int typedLength,
+        int take,
+        Func<List<T9Candidate>> collect)
+    {
+        if (!string.Equals(_rankedKey, key, StringComparison.Ordinal))
+        {
+            _ranked = T9MatchRank.Order(collect(), typedLength, int.MaxValue);
+            _rankedKey = key;
+        }
+
+        if (take >= _ranked.Count)
+        {
+            return _ranked;
+        }
+
+        var slice = new T9Candidate[Math.Max(0, take)];
+        for (var i = 0; i < slice.Length; i++)
+        {
+            slice[i] = _ranked[i];
+        }
+
+        return slice;
     }
 
     public string PinyinPreview(string digits)
@@ -214,24 +342,42 @@ internal sealed class T9Engine
             return [];
         }
 
+        return Ranked($"L\n{typed}", digits.Length, take, () => CollectLetters(typed, digits));
+    }
+
+    private List<T9Candidate> CollectLetters(string typed, string _)
+    {
         var hits = new List<T9Candidate>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var index in CandidateIndexes(digits))
+        foreach (var syllable in _syllables.MatchLettersForWords(typed))
         {
-            var entry = _entries[index];
-            var kind = ClassifyLetterMatch(entry.Pinyin, typed);
-            if (kind is null || !seen.Add(entry.Word))
+            if (!_byFirstSyllable.TryGetValue(syllable, out var bucket))
             {
                 continue;
             }
 
-            hits.Add(new T9Candidate
+            var taken = 0;
+            foreach (var index in bucket)
             {
-                Word = entry.Word,
-                Pinyin = entry.Pinyin,
-                Frequency = entry.Frequency,
-                MatchKind = kind
-            });
+                var entry = _entries[index];
+                var kind = ClassifyLetterMatch(entry.Pinyin, typed);
+                if (kind is null || !seen.Add(entry.Word))
+                {
+                    continue;
+                }
+
+                hits.Add(new T9Candidate
+                {
+                    Word = entry.Word,
+                    Pinyin = entry.Pinyin,
+                    Frequency = entry.Frequency,
+                    MatchKind = kind
+                });
+                if (++taken >= PrefixWordsPerSyllable)
+                {
+                    break;
+                }
+            }
         }
 
         foreach (var index in LatinIndexes(typed))
@@ -252,7 +398,7 @@ internal sealed class T9Engine
             });
         }
 
-        return T9MatchRank.Order(hits, digits.Length, take);
+        return hits;
     }
 
     public IReadOnlyList<T9Candidate> QueryLatin(string letters, int take = 40)
@@ -263,6 +409,11 @@ internal sealed class T9Engine
             return [];
         }
 
+        return Ranked($"E\n{typed}", typed.Length, take, () => CollectLatin(typed));
+    }
+
+    private List<T9Candidate> CollectLatin(string typed)
+    {
         var hits = new List<T9Candidate>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var index in LatinIndexes(typed))
@@ -283,7 +434,7 @@ internal sealed class T9Engine
             });
         }
 
-        return T9MatchRank.Order(hits, typed.Length, take);
+        return hits;
     }
 
     public static string CompactLetters(string pinyin)
@@ -341,26 +492,43 @@ internal sealed class T9Engine
             return compact.Length == typed.Length ? "全拼" : "全拼前缀";
         }
 
+        if (typed.StartsWith(compact, StringComparison.Ordinal) && compact.Length >= 2)
+        {
+            return "组词";
+        }
+
         var initials = SyllableInitials(pinyin);
         if (initials.StartsWith(typed, StringComparison.Ordinal))
         {
             return initials.Length == typed.Length ? "简拼" : "简拼前缀";
         }
 
+        if (typed.StartsWith(initials, StringComparison.Ordinal) && initials.Length >= 2)
+        {
+            return "简拼组词";
+        }
+
         return null;
     }
 
-    public static string FirstSyllable(string pinyin)
+    public static IReadOnlyList<string> Syllables(string pinyin)
     {
+        var parts = new List<string>();
         var syllable = new StringBuilder();
+        void Flush()
+        {
+            if (syllable.Length > 0)
+            {
+                parts.Add(syllable.ToString());
+                syllable.Clear();
+            }
+        }
+
         foreach (var raw in pinyin ?? "")
         {
             if (raw is ' ' or '\'' or '’' or '-')
             {
-                if (syllable.Length > 0)
-                {
-                    break;
-                }
+                Flush();
                 continue;
             }
 
@@ -371,7 +539,20 @@ internal sealed class T9Engine
             }
         }
 
-        return syllable.ToString();
+        Flush();
+        return parts;
+    }
+
+    public static string FirstSyllable(string pinyin)
+    {
+        var parts = Syllables(pinyin);
+        return parts.Count == 0 ? "" : parts[0];
+    }
+
+    public static string SyllableAt(string pinyin, int index)
+    {
+        var parts = Syllables(pinyin);
+        return index >= 0 && index < parts.Count ? parts[index] : "";
     }
 
     private IEnumerable<T9Candidate> ComposePhrases(string digits, List<T9Entry> heads)
@@ -393,13 +574,41 @@ internal sealed class T9Engine
             }
 
             var tails = new List<T9Entry>();
-            foreach (var index in CandidateIndexes(rest))
+            var seenTails = new HashSet<string>(StringComparer.Ordinal);
+            if (_exactFull.TryGetValue(rest, out var exactTails))
             {
-                var tail = _entries[index];
-                var kind = T9DigitMatch.Classify(tail.FullDigits, tail.InitialDigits, rest);
-                if (kind is "全拼" or "全拼前缀" or "组词")
+                foreach (var index in exactTails)
                 {
+                    var tail = _entries[index];
+                    if (seenTails.Add(tail.Word))
+                    {
+                        tails.Add(tail);
+                    }
+                }
+            }
+
+            foreach (var syllable in _syllables.MatchCurrent(rest))
+            {
+                if (!_byFirstSyllable.TryGetValue(syllable, out var bucket))
+                {
+                    continue;
+                }
+
+                var taken = 0;
+                foreach (var index in bucket)
+                {
+                    var tail = _entries[index];
+                    var kind = T9DigitMatch.Classify(tail.FullDigits, tail.InitialDigits, rest);
+                    if (kind is not ("全拼" or "全拼前缀" or "组词") || !seenTails.Add(tail.Word))
+                    {
+                        continue;
+                    }
+
                     tails.Add(tail);
+                    if (++taken >= ComposeTailLimit)
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -419,17 +628,6 @@ internal sealed class T9Engine
         }
     }
 
-    private IEnumerable<int> CandidateIndexes(string digits)
-    {
-        var key = digits.Length >= 2 ? digits[..2] : digits;
-        if (_prefixIndex.TryGetValue(key, out var list))
-        {
-            return list;
-        }
-
-        return Enumerable.Range(0, _entries.Count);
-    }
-
     private IEnumerable<int> LatinIndexes(string typed)
     {
         var key = typed.Length >= 2 ? typed[..2] : typed;
@@ -440,9 +638,24 @@ internal sealed class T9Engine
     {
         for (var i = 0; i < _entries.Count; i++)
         {
-            AddIndex(_entries[i].FullDigits, i);
-            AddIndex(_entries[i].InitialDigits, i);
+            var entry = _entries[i];
+            AddPosting(_exactFull, entry.FullDigits, i);
+            AddPrefix(_initialPrefix, entry.InitialDigits, i);
+            foreach (var syllable in Syllables(entry.Pinyin))
+            {
+                _syllables.Add(syllable);
+            }
+
+            var first = FirstSyllable(entry.Pinyin);
+            if (first.Length > 0)
+            {
+                AddPosting(_byFirstSyllable, first, i);
+            }
         }
+
+        SortPostings(_exactFull);
+        SortPostings(_byFirstSyllable);
+        SortPostings(_initialPrefix);
     }
 
     private void BuildLatinIndex()
@@ -474,21 +687,38 @@ internal sealed class T9Engine
         list.Add(index);
     }
 
-    private void AddIndex(string digits, int index)
+    private static void AddPosting(Dictionary<string, List<int>> map, string key, int index)
+    {
+        if (key.Length == 0)
+        {
+            return;
+        }
+
+        if (!map.TryGetValue(key, out var list))
+        {
+            list = [];
+            map[key] = list;
+        }
+
+        list.Add(index);
+    }
+
+    private static void AddPrefix(Dictionary<string, List<int>> map, string digits, int index)
     {
         if (digits.Length == 0)
         {
             return;
         }
 
-        var key = digits.Length >= 2 ? digits[..2] : digits;
-        if (!_prefixIndex.TryGetValue(key, out var list))
-        {
-            list = [];
-            _prefixIndex[key] = list;
-        }
+        AddPosting(map, digits.Length >= 2 ? digits[..2] : digits, index);
+    }
 
-        list.Add(index);
+    private void SortPostings(Dictionary<string, List<int>> map)
+    {
+        foreach (var list in map.Values)
+        {
+            list.Sort((left, right) => _entries[right].Frequency.CompareTo(_entries[left].Frequency));
+        }
     }
 
     private IEnumerable<string> LoadRimeOrPlainFile(string path, HashSet<string> seen, List<T9Entry>? into = null)

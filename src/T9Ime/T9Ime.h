@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <msctf.h>
+#include <ctffunc.h>
 #include <string>
 
 class T9Ime : public ITfTextInputProcessorEx,
@@ -10,7 +11,9 @@ class T9Ime : public ITfTextInputProcessorEx,
               public ITfTextLayoutSink,
               public ITfKeyEventSink,
               public ITfInputProcessorProfileActivationSink,
-              public ITfCompositionSink
+              public ITfCompositionSink,
+              public ITfFunctionProvider,
+              public ITfFnGetPreferredTouchKeyboardLayout
 {
 public:
     T9Ime();
@@ -60,6 +63,17 @@ public:
     // ITfCompositionSink
     STDMETHODIMP OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition* pComposition);
 
+    // ITfFunctionProvider — SearchHost / TabTip 通过 AdviseSingleSink 查询。
+    // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nn-msctf-itffunctionprovider
+    STDMETHODIMP GetType(GUID* pguid);
+    STDMETHODIMP GetDescription(BSTR* pbstrDesc);
+    STDMETHODIMP GetFunction(REFGUID rguid, REFIID riid, IUnknown** ppunk);
+
+    // ITfFunction / ITfFnGetPreferredTouchKeyboardLayout
+    // https://learn.microsoft.com/en-us/windows/win32/api/ctffunc/nn-ctffunc-itffngetpreferredtouchkeyboardlayout
+    STDMETHODIMP GetDisplayName(BSTR* pbstrName);
+    STDMETHODIMP GetLayout(TKBLayoutType* ptkblayoutType, WORD* pwPreferredLayoutId);
+
     void ApplyText(const wchar_t* text, int kind);
     void HandleLift(const wchar_t* spec);
     void HandleFrame(const void* data, int bytes);
@@ -77,6 +91,7 @@ private:
         bool HasCaret = false;
         bool HasScreen = false;
         bool LayoutPending = false;
+        bool HasRangeSelection = false;
     };
 
     class ContextProbeSession;
@@ -97,10 +112,23 @@ private:
     void RefreshDocumentState();
     void RefreshFromKeyContext(ITfContext* context);
     void PublishDocumentState(ITfDocumentMgr* document);
-    void PublishContextState(ITfContext* context, TfEditCookie readCookie = TF_INVALID_EDIT_COOKIE);
-    void CompleteContextProbe(ITfContext* context, LONG epoch, const ContextGeometry& geometry);
-    void EmitContextState(bool active, LONG epoch, const ContextGeometry& geometry);
+    void PublishContextState(
+        ITfContext* context,
+        TfEditCookie readCookie = TF_INVALID_EDIT_COOKIE,
+        int source = 0);
+    void CompleteContextProbe(
+        ITfContext* context,
+        LONG epoch,
+        const ContextGeometry& geometry,
+        int source = 0);
+    void EmitContextState(
+        bool active,
+        LONG epoch,
+        const ContextGeometry& geometry,
+        int source = 0);
     void PublishThreadState(bool focused);
+    void AdviseFunctionProvider();
+    void UnadviseFunctionProvider();
 
     LONG _ref;
     ITfThreadMgr* _threadMgr;
@@ -134,8 +162,11 @@ private:
     POINT _bandDragWindow;
     int _bandFrameWidth;
     int _bandFrameHeight;
+    int _bandX;
+    int _bandY;
     UINT32 _bandPointerId;
     static LRESULT CALLBACK BandProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    POINT MapBandPointer(HWND hwnd, POINT client) const;
     bool EnsureBandHost();
     void HideBandHost();
     bool BlitFrame(int x, int y, int width, int height, const BYTE* pixels);
@@ -146,6 +177,8 @@ private:
     HANDLE _cmdStop;
     HANDLE _cmdThread;
     HANDLE _cmdClient;
+    ITfFnSearchCandidateProvider* _searchCandidates;
+    bool _functionProviderAdvised;
 };
 
 enum T9ImeKind
@@ -157,7 +190,8 @@ enum T9ImeKind
     T9KindLift = 5,
     T9KindFrame = 6,
     T9KindQueryState = 7,
-    T9KindReturn = 8
+    T9KindReturn = 8,
+    T9KindSearchCandidates = 9
 };
 
 HRESULT RegisterT9Ime();

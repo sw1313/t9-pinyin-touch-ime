@@ -58,8 +58,8 @@ internal partial class T9OverlayWindow
         {
             Style = (Style)FindResource("FullKeyButton"),
             FontSize = spec.Action is FullKeyAction.Letter or FullKeyAction.Text or FullKeyAction.Function
-                ? 16
-                : 13
+                ? 19
+                : 16
         };
 
         if (spec.Action is FullKeyAction.Shift or FullKeyAction.Caps or FullKeyAction.Lang
@@ -99,7 +99,7 @@ internal partial class T9OverlayWindow
             stack.Children.Add(new TextBlock
             {
                 Text = primary,
-                FontSize = 16,
+                FontSize = 19,
                 HorizontalAlignment = HorizontalAlignment.Center
             });
             button.Content = stack;
@@ -124,7 +124,13 @@ internal partial class T9OverlayWindow
 
         void Tap() => OnFullKey(spec);
         Action hold = spec.Action == FullKeyAction.Symbol ? OnSymbolTray : Tap;
-        BindTap(button, Tap, hold, spec.Label, gestureRegion: false);
+        BindTap(
+            button,
+            Tap,
+            hold,
+            spec.Label,
+            gestureRegion: false,
+            repeatWhileHeld: KeyRepeatPolicy.Repeats(spec.Action));
         return button;
     }
 
@@ -410,7 +416,7 @@ internal partial class T9OverlayWindow
         _shift = nextShift;
         _ctrl = nextCtrl;
         _win = nextWin;
-        BuildKeys();
+        RebuildKeysWhenIdle();
     }
 
     private void ConsumeHeldModifiers()
@@ -448,7 +454,7 @@ internal partial class T9OverlayWindow
         _ctrl = nextCtrl;
         _alt = nextAlt;
         _win = nextWin;
-        BuildKeys();
+        RebuildKeysWhenIdle();
     }
 
     private string LocalizePunct(string text)

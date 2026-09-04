@@ -45,6 +45,25 @@ internal sealed class CaretQualityGate
         && nowTicks >= cachedTicks
         && nowTicks - cachedTicks <= hold.Ticks;
 
+    /// <summary>
+    /// SearchHost 的 uia/text 与 uia/box 元素身份不同，但描述的是同一个搜索框。
+    /// 外框锚在左上角 (72,100)，插入点在 (134,107)，当成换框就会把键盘拽飞。
+    /// 开始菜单与任务栏搜索的 Y 差近千像素，不会被这条当成同一个框。
+    /// </summary>
+    public static bool IsSameSearchChrome(
+        bool sameSurface,
+        int cachedRank,
+        int freshRank,
+        NativeRect cachedCaret,
+        NativeRect freshCaret) =>
+        sameSurface
+        && cachedRank >= 3
+        && freshRank <= 1
+        && !cachedCaret.IsEmpty
+        && !freshCaret.IsEmpty
+        && Math.Abs(freshCaret.Top - cachedCaret.Top) <= 80
+        && Math.Abs(freshCaret.Left - cachedCaret.Left) <= 160;
+
     private IntPtr _surface;
     private string _fieldId = string.Empty;
     private NativeRect _caret;
@@ -61,10 +80,16 @@ internal sealed class CaretQualityGate
         // 互切时窗口没变，会被认成同一个框在变差，于是继续沿用上一个框的坐标。
         var sameField = surface == _surface
             && string.Equals(fieldId, _fieldId, StringComparison.Ordinal);
+        var sameSearchChrome = IsSameSearchChrome(
+            surface == _surface,
+            Rank(_source),
+            Rank(source),
+            _caret,
+            caret);
         if (PrefersCached(
                 Rank(_source),
                 Rank(source),
-                sameField,
+                sameField || sameSearchChrome,
                 _stampTicks,
                 now,
                 Hold))

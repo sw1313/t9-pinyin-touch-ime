@@ -36,9 +36,9 @@ if ($Arch -eq "arm64") {
 $cmd = @"
 call `"$vcvars`" $vcArch
 cd /d `"$out`"
-cl /nologo /c /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE /I`"$src`" `"$src\T9Ime.cpp`" `"$src\DllMain.cpp`" `"$src\Register.cpp`"
+cl /nologo /c /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE /I`"$src`" `"$src\T9Ime.cpp`" `"$src\DllMain.cpp`" `"$src\Register.cpp`" `"$src\SipCancel.cpp`" `"$src\TsfFunctions.cpp`"
 if errorlevel 1 exit /b 1
-link /nologo /DLL /DEF:`"$src\T9Ime.def`" /OUT:`"$dllName`" T9Ime.obj DllMain.obj Register.obj ole32.lib oleaut32.lib uuid.lib advapi32.lib user32.lib shell32.lib gdi32.lib
+link /nologo /DLL /DEF:`"$src\T9Ime.def`" /OUT:`"$dllName`" T9Ime.obj DllMain.obj Register.obj SipCancel.obj TsfFunctions.obj ole32.lib oleaut32.lib uuid.lib advapi32.lib user32.lib shell32.lib gdi32.lib
 if errorlevel 1 exit /b 1
 exit /b 0
 "@

@@ -1,17 +1,14 @@
 #requires -Version 7.0
-# 自己切 T9 / 微软拼音，核对本机 T9Pane 是否跟上语言栏并改「显示触摸键盘」。
+# 自己切 T9 / 微软拼音，核对本机 T9Pane 是否跟上语言栏的切换。
+#
+# 0.1.19 起不再改「显示触摸键盘」，所以这里只验收语言栏跟随；
+# 「不写注册表」由 Test-NoRegistryFootprint.ps1 单独验收。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $csproj = Join-Path $root 'src\T9Pane\T9Pane.csproj'
 $version = (Select-String -LiteralPath $csproj -Pattern '<Version>([^<]+)</Version>').Matches[0].Groups[1].Value
 $setup = Join-Path $root "dist\T9-Pinyin-Touch-IME-$version-Setup.exe"
 $log = Join-Path $env:APPDATA 'T9Pane\t9pane.log'
-$asm = 'HKCU:\Software\Microsoft\CTF\Assemblies\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}'
-$tip = 'HKCU:\Software\Microsoft\TabletTip\1.7'
-$inp = 'HKCU:\Software\Microsoft\input\Settings'
-$T9 = '{A7E91C20-4B3D-4F18-9C2A-1B8E6D0A1001}'
-$Mspy = '{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}'
-
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -90,17 +87,6 @@ function Wait-T9Pane([string]$want) {
     throw "T9Pane $want 没有在 40 秒内起来（当前 $(Get-InstalledVersion)）"
 }
 
-function Read-Hold {
-    $held = $null
-    $tap = $null
-    if (Test-Path -LiteralPath $tip) {
-        $props = Get-ItemProperty -LiteralPath $tip
-        $held = $props.'T9Pane.Backup.Active'
-        $tap = $props.TouchKeyboardTapInvoke
-    }
-    return [pscustomobject]@{ Held = $held; Tap = $tap }
-}
-
 function Wait-Log([string]$pattern, [datetime]$after, [int]$seconds) {
     $end = [datetime]::UtcNow.AddSeconds($seconds)
     while ([datetime]::UtcNow -lt $end) {
@@ -137,26 +123,23 @@ $restore = [LayoutHoldTsf]::ActiveName()
 Write-Host "当前 GetActiveProfile=$restore"
 $failed = $false
 try {
+    # 起点必须是「不在 T9」，否则下面切到 T9 是空操作、根本不会产生切换日志。
+    if ($restore -eq 'T9') {
+        Write-Host '当前已在 T9，先切到微软拼音建立基线'
+        if ([LayoutHoldTsf]::ActivateMspy() -ne 0) { throw '建立基线失败' }
+        Start-Sleep -Seconds 2
+    }
+
     $t9At = Get-Date
     $hr = [LayoutHoldTsf]::ActivateT9()
     Write-Host ("ActivateT9 hr=0x{0:X8} active={1}" -f $hr, [LayoutHoldTsf]::ActiveName())
     if ($hr -ne 0) { throw "ActivateT9 失败" }
-    $ok = $false
-    $end = [datetime]::UtcNow.AddSeconds(10)
-    while ([datetime]::UtcNow -lt $end) {
-        $line = Wait-Log '语言栏布局 T9 九键' $t9At 1
-        $hold = Read-Hold
-        if ($hold.Tap -eq 0 -and $hold.Held -eq 1) {
-            Write-Host "T9 日志=$line"
-            Write-Host ("T9 Held={0} 官方Tap={1}" -f $hold.Held, $hold.Tap)
-            $ok = $true
-            break
-        }
-        Start-Sleep -Milliseconds 300
+    $line = Wait-Log '语言栏布局 T9 九键' $t9At 10
+    if ($line) {
+        Write-Host "T9 日志=$line"
     }
-    if (-not $ok) {
-        $hold = Read-Hold
-        Write-Host ("FAIL: 切到 T9 后未稳住从不  Held={0} 官方Tap={1}" -f $hold.Held, $hold.Tap)
+    else {
+        Write-Host "FAIL: 切到 T9 后 T9Pane 没跟上语言栏"
         $failed = $true
     }
 
@@ -164,22 +147,12 @@ try {
     $hr = [LayoutHoldTsf]::ActivateMspy()
     Write-Host ("ActivateMspy hr=0x{0:X8} active={1}" -f $hr, [LayoutHoldTsf]::ActiveName())
     if ($hr -ne 0) { throw "ActivateMspy 失败" }
-    $ok = $false
-    $end = [datetime]::UtcNow.AddSeconds(10)
-    while ([datetime]::UtcNow -lt $end) {
-        $line = Wait-Log '语言栏布局 其他输入法' $msAt 1
-        $hold = Read-Hold
-        if ($line -and $hold.Held -ne 1 -and $hold.Tap -ne 0) {
-            Write-Host "MSPY 日志=$line"
-            Write-Host ("MSPY Held={0} 官方Tap={1}" -f $hold.Held, $hold.Tap)
-            $ok = $true
-            break
-        }
-        Start-Sleep -Milliseconds 300
+    $line = Wait-Log '语言栏布局 其他输入法' $msAt 10
+    if ($line) {
+        Write-Host "MSPY 日志=$line"
     }
-    if (-not $ok) {
-        $hold = Read-Hold
-        Write-Host ("FAIL: 切走 T9 后未恢复  Held={0} 官方Tap={1}" -f $hold.Held, $hold.Tap)
+    else {
+        Write-Host "FAIL: 切走 T9 后 T9Pane 没跟上语言栏"
         $failed = $true
     }
 } finally {

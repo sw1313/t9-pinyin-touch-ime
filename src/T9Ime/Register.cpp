@@ -48,6 +48,9 @@ static HRESULT RegisterCategories(BOOL enable)
 
     if (enable)
     {
+        // 官方搜索窗会把 UIELEMENTENABLED TIP 切成 UILess，禁止自绘。
+        // 本 IME 用 CreateWindowInBand 画自定义盘，不能进这个分类。
+        // https://learn.microsoft.com/en-us/windows/win32/tsf/uiless-mode-overview
         cat->UnregisterCategory(
             CLSID_T9Ime,
             GUID_TFCAT_TIPCAP_UIELEMENTENABLED,

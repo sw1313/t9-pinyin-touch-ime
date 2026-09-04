@@ -13,7 +13,7 @@
         ResizeMode="NoResize"
         Focusable="False"
         Width="400"
-        Height="360"
+        Height="404"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Display">
@@ -410,26 +410,23 @@
                 <Button x:Name="LangButton"
                         Style="{StaticResource FunctionKeyButton}"
                         Content="中 / EN"
-                        FontSize="14"
-                        Click="OnModeClicked"/>
-                <Button Grid.Column="1"
+                        FontSize="14"/>
+                <Button x:Name="SpaceButton"
+                        Grid.Column="1"
                         Style="{StaticResource KeyButton}"
                         Content="空格"
                         FontSize="14"
-                        FontWeight="Normal"
-                        Click="OnSpaceClicked"/>
+                        FontWeight="Normal"/>
                 <Button x:Name="DigitButton"
                         Grid.Column="2"
                         Style="{StaticResource FunctionKeyButton}"
                         Content="123"
-                        FontSize="14"
-                        Click="OnDigitModeClicked"/>
+                        FontSize="14"/>
                 <Button x:Name="EnterButton"
                         Grid.Column="3"
                         Style="{StaticResource PrimaryKeyButton}"
                         FontSize="14"
-                        ToolTip="回车"
-                        Click="OnEnterClicked"/>
+                        ToolTip="回车"/>
             </Grid>
             </Grid>
         </Grid>

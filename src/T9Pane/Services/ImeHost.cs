@@ -21,6 +21,7 @@ internal sealed class ImeClient
     public uint ContextSequence { get; set; }
     public uint ContextEpoch { get; set; }
     public int LayoutState { get; set; }
+    public bool HasRangeSelection { get; set; }
     public NativeRect NativeCaret { get; set; }
     public NativeRect NativeScreen { get; set; }
     public IntPtr ViewHwnd { get; set; }
@@ -42,6 +43,7 @@ internal sealed class ImeHost : IDisposable
     public const int KindFrame = 6;
     public const int KindQueryState = 7;
     public const int KindReturn = 8;
+    public const int KindSearchCandidates = 9;
     public const int MaxPacketBytes = 16 * 1024 * 1024;
 
     private readonly System.Collections.Concurrent.BlockingCollection<string> _notifications =
@@ -58,6 +60,7 @@ internal sealed class ImeHost : IDisposable
     private CancellationTokenSource? _layoutDebounce;
     private ulong _visibleHostHwnd;
     private long _observationSequence;
+    private int _hostPointerLive;
     private CancellationTokenSource? _cts;
 
     public event Action? Changed;
@@ -66,9 +69,29 @@ internal sealed class ImeHost : IDisposable
     public event Action<int, int, int, int>? HostSwipe;
     public event Action<int, int>? HostMoved;
     public event Action<bool>? HostVisibilityChanged;
-    public bool HasDocumentFocus { get; private set; } = true;
+    public bool HasDocumentFocus { get; private set; }
+    public bool HasRangeSelection { get; private set; }
+    public bool LastChangeIsLayoutOnly { get; private set; }
 
-    private void RaiseChanged() => Changed?.Invoke();
+    /// <summary>
+    /// 手指还按在系统浮层盘面上。长按连发期间一直为真，直到抬起。
+    /// </summary>
+    public bool HostPointerLive => Volatile.Read(ref _hostPointerLive) != 0;
+
+    private void SetHostPointerLive(bool live)
+    {
+        Interlocked.Exchange(ref _hostPointerLive, live ? 1 : 0);
+        if (live)
+        {
+            OverlayTouch.Note();
+        }
+    }
+
+    private void RaiseChanged(bool layoutOnly = false)
+    {
+        LastChangeIsLayoutOnly = layoutOnly;
+        Changed?.Invoke();
+    }
 
     public bool HasClient
     {
@@ -207,37 +230,7 @@ internal sealed class ImeHost : IDisposable
 
     public void NoteThreadProfile(bool _) => RefreshUserLayout("TSF");
 
-    public void RefreshUserLayout(string reason)
-    {
-        if (reason == "启动")
-        {
-            ApplyUserLayout(reason);
-            return;
-        }
-
-        CancellationToken token;
-        lock (_gate)
-        {
-            _layoutDebounce?.Cancel();
-            _layoutDebounce?.Dispose();
-            _layoutDebounce = new CancellationTokenSource();
-            token = _layoutDebounce.Token;
-        }
-
-        _ = DebounceUserLayout(reason, token);
-    }
-
-    private async Task DebounceUserLayout(string reason, CancellationToken token)
-    {
-        try
-        {
-            await Task.Delay(200, token).ConfigureAwait(false);
-            ApplyUserLayout(reason);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-    }
+    public void RefreshUserLayout(string reason) => ApplyUserLayout(reason);
 
     private void ApplyUserLayout(string reason)
     {
@@ -383,11 +376,17 @@ internal sealed class ImeHost : IDisposable
                 unchecked((ulong)client.Hwnd.ToInt64()),
                 client.ContextEpoch,
                 unchecked((ulong)client.ViewHwnd.ToInt64()),
-                0));
+                0),
+            CaretIsTrusted: true,
+            IsInsertionCaret: !client.HasRangeSelection,
+            HasRangeSelection: client.HasRangeSelection);
         return true;
     }
 
     public void Compose(string text) => Send(KindCompose, text);
+
+    public void OfferSearchCandidates(string packed) =>
+        Send(KindSearchCandidates, packed);
 
     public void Commit(string text) => Send(KindCommit, text);
 
@@ -411,6 +410,7 @@ internal sealed class ImeHost : IDisposable
             SendPipe(new IntPtr((long)channel.Hwnd), channel.Pid, KindLift, payload);
         }
         _visibleHostHwnd = 0;
+        SetHostPointerLive(false);
     }
 
     public bool ShowHost(
@@ -489,6 +489,7 @@ internal sealed class ImeHost : IDisposable
 
         if (SendPipe(hwnd, pid, kind, Encoding.Unicode.GetBytes((text ?? "") + "\0")))
         {
+            Log.Info($"IME 上屏 kind={kind} pid={pid} 长度={(text ?? "").Length}");
             return true;
         }
 
@@ -770,6 +771,8 @@ internal sealed class ImeHost : IDisposable
             var activeFlags = ReadUInt(json, "activeFlags");
             var immersive = ReadUInt(json, "immersive") != 0;
             var uiElementOnly = ReadUInt(json, "uiElementOnly") != 0;
+            // 宿主进程里是否接住了系统输入面板的显示请求，决定官方键盘会不会露头。
+            var sipCancel = ReadUInt(json, "sipCancel") != 0;
             if (ShouldIgnoreDeactivate(hwnd, pid))
             {
                 Log.Warn("IME 激活缺少 hwnd/pid，忽略");
@@ -816,7 +819,7 @@ internal sealed class ImeHost : IDisposable
             }
             HasDocumentFocus = effectiveDocumentFocused;
             Log.Info(
-                $"T9 九键已激活 pid={pid} hwnd={hwnd} doc={documentFocused} thread={threadFocused} seq={sequence}");
+                $"T9 九键已激活 pid={pid} hwnd={hwnd} doc={documentFocused} thread={threadFocused} sipCancel={sipCancel} seq={sequence}");
             RefreshUserLayout("激活");
             RaiseChanged();
             return;
@@ -913,6 +916,8 @@ internal sealed class ImeHost : IDisposable
             var sequence = ReadUInt(json, "seq");
             var epoch = ReadUInt(json, "epoch");
             var layout = (int)ReadUInt(json, "layout");
+            var source = ReadUInt(json, "src");
+            var rangeSelected = ReadUInt(json, "sel") != 0;
             var activeFlags = ReadUInt(json, "activeFlags");
             var immersive = ReadUInt(json, "immersive") != 0;
             var uiElementOnly = ReadUInt(json, "uiElementOnly") != 0;
@@ -958,7 +963,8 @@ internal sealed class ImeHost : IDisposable
                             Right = ReadInt(json, "sr"),
                             Bottom = ReadInt(json, "sb")
                         },
-                        new IntPtr((long)ReadULong(json, "view"))))
+                        new IntPtr((long)ReadULong(json, "view")),
+                        rangeSelected))
                 {
                     return;
                 }
@@ -980,10 +986,11 @@ internal sealed class ImeHost : IDisposable
             }
 
             HasDocumentFocus = active;
+            HasRangeSelection = active && rangeSelected;
             Log.Info(
                 $"TSF 上下文 {(active ? "有效" : "无效")} pid={pid} hwnd={hwnd} "
-                + $"epoch={epoch} layout={layout} seq={sequence}");
-            RaiseChanged();
+                + $"epoch={epoch} layout={layout} src={source} sel={(rangeSelected ? 1 : 0)} seq={sequence}");
+            RaiseChanged(LayoutSyncPolicy.IsLayoutOnly(source, active, rangeSelected));
             return;
         }
 
@@ -1068,6 +1075,7 @@ internal sealed class ImeHost : IDisposable
 
         if (json.Contains("\"t\":\"press\"", StringComparison.Ordinal))
         {
+            SetHostPointerLive(true);
             HostPress?.Invoke(
                 (int)ReadUInt(json, "x"),
                 (int)ReadUInt(json, "y"));
@@ -1076,6 +1084,8 @@ internal sealed class ImeHost : IDisposable
 
         if (json.Contains("\"t\":\"hit\"", StringComparison.Ordinal))
         {
+            OverlayTouch.Note();
+            SetHostPointerLive(false);
             HostHit?.Invoke(
                 (int)ReadUInt(json, "x"),
                 (int)ReadUInt(json, "y"));
@@ -1084,11 +1094,20 @@ internal sealed class ImeHost : IDisposable
 
         if (json.Contains("\"t\":\"swipe\"", StringComparison.Ordinal))
         {
+            OverlayTouch.Note();
+            SetHostPointerLive(false);
             HostSwipe?.Invoke(
                 (int)ReadUInt(json, "x1"),
                 (int)ReadUInt(json, "y1"),
                 (int)ReadUInt(json, "x2"),
                 (int)ReadUInt(json, "y2"));
+            return;
+        }
+
+        if (json.Contains("\"t\":\"release\"", StringComparison.Ordinal))
+        {
+            OverlayTouch.Note();
+            SetHostPointerLive(false);
             return;
         }
 
@@ -1121,6 +1140,7 @@ internal sealed class ImeHost : IDisposable
             else if (error != 0)
             {
                 Log.Warn($"系统浮层 HostRender 失败 err={error}");
+                SetHostPointerLive(false);
                 HostVisibilityChanged?.Invoke(false);
             }
             return;
@@ -1132,6 +1152,12 @@ internal sealed class ImeHost : IDisposable
                 $"TSF 编辑失败 pid={ReadUInt(json, "pid")} "
                 + $"kind={ReadInt(json, "kind")} hr=0x{unchecked((uint)ReadInt(json, "hr")):X8}");
             return;
+        }
+
+        if (json.Contains("\"t\":\"fn\"", StringComparison.Ordinal))
+        {
+            var name = Regex.Match(json, "\"name\":\"([^\"]+)\"");
+            Log.Info($"TSF 官方函数 {(name.Success ? name.Groups[1].Value : "?")}");
         }
 
     }
@@ -1167,6 +1193,16 @@ internal sealed class ImeHost : IDisposable
         {
             hwnd = visible.Hwnd;
             pid = ImeRouting.PidOf(visible);
+            return pid != 0;
+        }
+
+        // HostRender 画在 SearchHost 进程里。点键盘不会激活 Band 窗，
+        // GetForegroundWindow 经常还是 explorer。上屏钉在正在显示这帧的 TIP。
+        if (ImeRouting.TryPickHostClient(_clients, _visibleHostHwnd, out var pinned)
+            && pinned is not null)
+        {
+            hwnd = pinned.Hwnd;
+            pid = ImeRouting.PidOf(pinned);
             return pid != 0;
         }
 

@@ -31,11 +31,7 @@ internal static class InputPaneController
         return InputPaneInterop.TryGetLocation(out _);
     }
 
-    public static void TryHide()
-    {
-        SipInvoker.Reset();
-        SipSuppressor.HideOfficial();
-    }
+    public static void TryHide() => SipInvoker.Reset();
 
     public static bool TryHideWinRt(IntPtr hwnd) => TryWinRt(hwnd, hide: true);
 

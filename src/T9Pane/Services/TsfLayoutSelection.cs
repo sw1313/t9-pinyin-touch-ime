@@ -25,13 +25,12 @@ internal static class TsfLayoutSelection
 
     public static bool IsT9Selected()
     {
-        if (TryGetActive(out var clsid, out var profile))
-        {
-            return OfficialT9ProfilePolicy.IsT9Layout(clsid, profile);
-        }
-
-        return TryReadAssembly(OfficialT9ProfilePolicy.SimplifiedChinese, out clsid, out profile)
-            && OfficialT9ProfilePolicy.IsT9Layout(clsid, profile);
+        // 默认程序集是「该语言的默认 TIP」，切到微软拼音不会改。
+        // 只能认 GetActiveProfile，认错就会在别的输入法下继续拦官方键盘。
+        var active = TryGetActive(out var clsid, out var profile);
+        return OfficialT9ProfilePolicy.IsCurrentSelection(
+            active,
+            active && OfficialT9ProfilePolicy.IsT9Layout(clsid, profile));
     }
 
     public static bool TryGetActive(out Guid clsid, out Guid profile)

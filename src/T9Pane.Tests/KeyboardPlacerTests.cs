@@ -42,6 +42,47 @@ public class KeyboardPlacerTests
     }
 
     [Fact]
+    public void Chat_compose_box_taller_than_72_is_still_excluded()
+    {
+        var caret = Rect(480, 1140, 482, 1170);
+        var fieldBox = Rect(400, 1080, 980, 1190);
+        var work = Rect(0, 0, 1920, 1200);
+        var box = KeyboardPlacer.Place(
+            new InputField(
+                IntPtr.Zero,
+                caret,
+                default,
+                FieldBox: fieldBox),
+            620,
+            360,
+            work);
+
+        Assert.False(box.Intersects(fieldBox), "组合框高于 72 时仍不能盖住输入行");
+        Assert.True(box.Bottom <= fieldBox.Top);
+    }
+
+    [Fact]
+    public void Untrusted_box_caret_on_tall_field_excludes_the_bottom_line()
+    {
+        var boxTop = Rect(1058, 202, 1060, 226);
+        var fieldBox = Rect(400, 200, 1200, 1180);
+        var work = Rect(0, 0, 1920, 1200);
+        var placed = KeyboardPlacer.Place(
+            new InputField(
+                IntPtr.Zero,
+                boxTop,
+                default,
+                CaretIsTrusted: false,
+                FieldBox: fieldBox),
+            620,
+            360,
+            work);
+
+        var typingLine = Rect(400, 1132, 1200, 1180);
+        Assert.False(placed.Intersects(typingLine), "外框顶边不能把底行组合区盖住");
+    }
+
+    [Fact]
     public void Compact_field_box_is_excluded_like_cfs_exclude()
     {
         var caret = Rect(420, 844, 422, 868);
@@ -81,6 +122,15 @@ public class KeyboardPlacerTests
             visible: false,
             currentHost: new IntPtr(100),
             nextHost: new IntPtr(200)));
+        Assert.False(KeyboardPositionSession.ShouldTearDownBeforePlace(
+            restart: true,
+            nextRequiresHostRender: true));
+        Assert.True(KeyboardPositionSession.ShouldTearDownBeforePlace(
+            restart: true,
+            nextRequiresHostRender: false));
+        Assert.False(KeyboardPositionSession.ShouldTearDownBeforePlace(
+            restart: false,
+            nextRequiresHostRender: false));
     }
 
     [Fact]
@@ -325,6 +375,118 @@ public class KeyboardPlacerTests
         Assert.True(KeyboardPositionSession.ShouldFollowTypingLine(
             Rect(200, 400, 202, 422),
             Rect(200, 426, 202, 448)));
+        var held = KeyboardPositionSession.PinHorizontal(
+            Rect(200, 400, 820, 760),
+            Rect(440, 448, 1060, 808));
+        Assert.Equal(200, held.Left);
+        Assert.Equal(448, held.Top);
+        Assert.Equal(620, held.Width);
+        Assert.Equal(820, held.Right);
+        Assert.False(KeyboardPositionSession.ShouldMoveVisibleWindow(
+            sameRect: true,
+            hostModeChanged: false));
+        Assert.True(KeyboardPositionSession.ShouldMoveVisibleWindow(
+            sameRect: false,
+            hostModeChanged: false));
+        Assert.True(KeyboardPositionSession.ShouldMoveVisibleWindow(
+            sameRect: true,
+            hostModeChanged: true));
+        var box = new NativeRect { Left = 400, Top = 1060, Right = 900, Bottom = 1120 };
+        var caret = new NativeRect { Left = 748, Top = 1080, Right = 750, Bottom = 1110 };
+        var other = new NativeRect { Left = 419, Top = 959, Right = 421, Bottom = 997 };
+        Assert.True(KeyboardPositionSession.CaretBelongsToAuthorizedField(
+            box, caret, caret, box));
+        Assert.False(KeyboardPositionSession.CaretBelongsToAuthorizedField(
+            box, caret, other, default));
+        Assert.False(KeyboardPositionSession.ShouldReplaceAuthorizedField(
+            box,
+            caret,
+            other,
+            default,
+            incomingFromClicked: false,
+            nativeAndUiAgree: false,
+            nativeOnly: false));
+        Assert.True(KeyboardPositionSession.ShouldReplaceAuthorizedField(
+            box,
+            caret,
+            other,
+            default,
+            incomingFromClicked: false,
+            nativeAndUiAgree: true,
+            nativeOnly: false));
+        Assert.True(KeyboardPositionSession.ShouldReplaceAuthorizedField(
+            box,
+            caret,
+            other,
+            default,
+            incomingFromClicked: false,
+            nativeAndUiAgree: false,
+            nativeOnly: false,
+            focusEntered: true,
+            incomingCaretTrusted: true));
+        Assert.True(KeyboardPositionSession.ShouldReplaceAuthorizedField(
+            box,
+            caret,
+            other,
+            default,
+            incomingFromClicked: false,
+            nativeAndUiAgree: false,
+            nativeOnly: false,
+            authorizedFieldId: "search",
+            incomingFieldId: "address"));
+        Assert.True(KeyboardPositionSession.ShouldReplaceAuthorizedField(
+            box,
+            caret,
+            other,
+            default,
+            incomingFromClicked: false,
+            nativeAndUiAgree: false,
+            nativeOnly: false,
+            manualTap: true));
+        Assert.False(KeyboardPositionSession.ShouldFollowTypingLine(
+            caret,
+            new NativeRect { Left = 760, Top = 1080, Right = 762, Bottom = 1110 }));
+        Assert.True(KeyboardPositionSession.ShouldFollowCaretTap(
+            caret,
+            new NativeRect { Left = 760, Top = 1080, Right = 762, Bottom = 1110 }));
+        var sameLineTap = new NativeRect { Left = 760, Top = 1080, Right = 762, Bottom = 1110 };
+        var otherFieldCaret = new NativeRect { Left = 485, Top = 1142, Right = 487, Bottom = 1172 };
+        Assert.False(KeyboardPositionSession.LooksLikeAnotherField(
+            box, caret, sameLineTap, box));
+        Assert.True(KeyboardPositionSession.LooksLikeAnotherField(
+            box, caret, otherFieldCaret, default));
+        Assert.False(KeyboardPositionSession.ShouldHideWhenTapLeavesAuthorizedField(
+            alreadyVisible: true,
+            hasExternalGesture: true,
+            caretBelongs: false,
+            anotherField: false));
+        Assert.True(KeyboardPositionSession.ShouldHideWhenTapLeavesAuthorizedField(
+            alreadyVisible: true,
+            hasExternalGesture: true,
+            caretBelongs: false,
+            anotherField: true));
+        Assert.False(KeyboardPositionSession.ShouldHideWhenTapLeavesAuthorizedField(
+            alreadyVisible: true,
+            hasExternalGesture: true,
+            caretBelongs: true,
+            anotherField: true));
+        Assert.False(KeyboardPositionSession.ShouldHideWhenTapLeavesAuthorizedField(
+            alreadyVisible: true,
+            hasExternalGesture: true,
+            caretBelongs: false,
+            anotherField: true,
+            surfaceChanged: true));
+        Assert.False(KeyboardPositionSession.ShouldHideWhenTapLeavesAuthorizedField(
+            alreadyVisible: true,
+            hasExternalGesture: true,
+            caretBelongs: false,
+            anotherField: true,
+            searchSession: true));
+        Assert.False(KeyboardPositionSession.ShouldFollowTypingLine(
+            Rect(200, 400, 202, 422),
+            Rect(200, 526, 480, 548),
+            previousIsInsertion: true,
+            nextIsInsertion: false));
     }
 
     [Fact]

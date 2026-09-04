@@ -1,10 +1,13 @@
 namespace T9Pane.Services;
 
 /// <summary>
-/// 数字盘和符号盘更常改错，底栏主键改成退格。
+/// 数字盘、符号盘、展开选字时，底栏右下角是退格而不是回车。
 /// </summary>
 internal static class ToolBarPolicy
 {
-    public static bool BackspaceInsteadOfEnter(bool numberPad, bool symbolBoard) =>
-        numberPad || symbolBoard;
+    public static bool BackspaceInsteadOfEnter(
+        bool numberPad,
+        bool symbolBoard,
+        bool candidatesExpanded = false) =>
+        numberPad || symbolBoard || candidatesExpanded;
 }

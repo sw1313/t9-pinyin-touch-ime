@@ -95,6 +95,21 @@ internal static class SipLayer
             NativeMethods.SwpNoMove | NativeMethods.SwpNoSize | NativeMethods.SwpNoActivate | NativeMethods.SwpFrameChanged);
     }
 
+    /// <summary>
+    /// 官方触摸键盘在 IHM 层，高于普通 Topmost。平板上若没藏干净，
+    /// 九键必须升到同一层才压得住。
+    /// </summary>
+    public static void RaiseToIhmBand(IntPtr overlay)
+    {
+        if (overlay == IntPtr.Zero)
+        {
+            return;
+        }
+
+        TryMatchKeyboardBand(overlay, IntPtr.Zero);
+        Raise(overlay, IntPtr.Zero);
+    }
+
     public static bool TrySetOwner(IntPtr overlay, IntPtr keyboard)
     {
         if (overlay == IntPtr.Zero)

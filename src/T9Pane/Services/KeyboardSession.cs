@@ -1,3 +1,4 @@
+using System.Windows.Threading;
 using T9Pane.Native;
 using T9Pane.Overlay;
 
@@ -28,6 +29,20 @@ internal static class DesktopContextGracePolicy
         && profileActive
         && elapsed >= TimeSpan.Zero
         && elapsed <= TimeSpan.FromMilliseconds(graceMilliseconds);
+
+    /// <summary>
+    /// TipTsfHelper 不因短暂 TSF 无效 Hide。Chromium 换框会先 SetFocus(null)，
+    /// 授权后一两秒内租约抖动不能把刚弹出来的盘收掉。
+    /// </summary>
+    public static bool ShouldHoldAfterAuthorize(
+        bool overlayVisible,
+        bool sameForegroundHost,
+        TimeSpan sinceAuthorize,
+        int holdMilliseconds = 2000) =>
+        overlayVisible
+        && sameForegroundHost
+        && sinceAuthorize >= TimeSpan.Zero
+        && sinceAuthorize <= TimeSpan.FromMilliseconds(holdMilliseconds);
 }
 
 internal static class KeyboardInvocationPolicy
@@ -78,8 +93,9 @@ internal static class KeyboardInvocationPolicy
         }
         if (hit == PointerInputHit.Unavailable)
         {
-            // 看不清就不决断。不在这一拍用时钟收盘。
-            return false;
+            // 触摸点在整页容器上时补判定还没到。到期必须消费掉，
+            // 否则 2 秒里每 70ms 全量 UIA，打字会被拖死。
+            return expired;
         }
 
         authorized = ShouldAuthorize(
@@ -97,6 +113,31 @@ internal static class KeyboardInvocationPolicy
             or PointerInvocationOrigin.StartMenuSurface;
 
     /// <summary>
+    /// 平板授权经常看不到钩子原点。开始菜单 / SearchHost 仍是同一次搜索会话，
+    /// 必须标成搜索原点，否则联想 Button 会被当成离开。
+    /// </summary>
+    public static PointerInvocationOrigin OriginForSearchSurface(
+        string processName,
+        bool trayChrome,
+        bool searchFlyoutVisible)
+    {
+        if (processName is "searchhost" or "searchapp" or "searchui" or "searchapp.desktop"
+            or "startmenuexperiencehost")
+        {
+            return PointerInvocationOrigin.StartMenuSearch;
+        }
+
+        if (processName == "explorer" && (trayChrome || searchFlyoutVisible))
+        {
+            return trayChrome
+                ? PointerInvocationOrigin.TaskbarSearch
+                : PointerInvocationOrigin.StartMenuSearch;
+        }
+
+        return PointerInvocationOrigin.Unknown;
+    }
+
+    /// <summary>
     /// 只有“还在等搜索框出现”时才忽略焦点落到按钮。
     /// 键盘已经弹出来之后，失焦必须收；否则收起后又被同一下点击重新授权。
     /// </summary>
@@ -111,21 +152,6 @@ internal static class KeyboardInvocationPolicy
     /// </summary>
     public static bool ShouldConsumeLeaveClick(PointerInputHit hit) =>
         hit == PointerInputHit.Outside;
-
-    /// <summary>
-    /// SampleIME 只在候选窗自己的文档指针变了才藏。TSF 上下文无效本身不够：
-    /// Chromium 换框会先 SetFocus(null)，SearchHost 交接也会打无效。
-    /// 必须同时有一次尚未判成输入的点击，且 UIA 也不是输入框，才是真离开。
-    /// </summary>
-    public static bool ShouldDismissForLostDocument(
-        bool documentFocused,
-        bool uiaLooksLikeTextInput,
-        bool searchSession,
-        bool hasUnresolvedLeaveClick) =>
-        !documentFocused
-        && !uiaLooksLikeTextInput
-        && !searchSession
-        && hasUnresolvedLeaveClick;
 
     /// <summary>
     /// 这一下落在当前授权框外面，又还没点中新的输入框：先放下旧框。
@@ -186,6 +212,283 @@ internal static class KeyboardInvocationPolicy
                     or PointerInvocationOrigin.StartMenuSearch)
                     || (previouslyAuthorized && !userDismissed)));
     }
+
+    /// <summary>
+    /// 平板上触摸经常升不成鼠标，全局钩子看不到按下。焦点已经进了输入框
+    /// 就允许弹——这是触屏系统键盘的常规行为，桌面仍必须点到框里。
+    /// </summary>
+    public static bool ShouldAuthorizeSlateFocus(
+        bool slateDevice,
+        bool focusedLooksLikeTextInput) =>
+        slateDevice && focusedLooksLikeTextInput;
+
+    /// <summary>
+    /// 平板上点到系统键盘盘面（看不清）或焦点刚进输入框，都可以授权。
+    /// 已经判定为离开的点击不能再靠“还有输入框”拉回来。
+    /// </summary>
+    public static bool ShouldAuthorizeSlateOcclusion(
+        bool slateDevice,
+        bool hasInputField,
+        bool focusEnteredTextInput,
+        bool pointerOnOfficialSip,
+        bool pageSurface = false,
+        bool editTap = true) =>
+        slateDevice
+        && hasInputField
+        && editTap
+        && (focusEnteredTextInput || pointerOnOfficialSip)
+        && !(pageSurface && !focusEnteredTextInput);
+
+    public static bool ShouldAwaitSlateFocus(
+        bool searchSession,
+        bool slateDevice,
+        bool focusEnteredTextInput) =>
+        searchSession || (slateDevice && focusEnteredTextInput);
+
+    /// <summary>
+    /// 系统插入点/选区手柄是透明窗，UIA 焦点会漂到 Thumb、选区菜单。
+    /// 只有这类铬才忽略离开；点按钮、链接、整页必须收。
+    /// </summary>
+    public static bool ShouldIgnoreFocusLeft(
+        bool documentFocused,
+        bool slateDevice,
+        bool selectionChrome) =>
+        documentFocused && slateDevice && selectionChrome;
+
+    /// <summary>
+    /// SampleIME 只在候选窗自己的文档指针变了才藏。TSF 上下文无效本身不够：
+    /// Chromium / Cursor 打字时会先 SetFocus(null)。日志里授权弹出后十几毫秒
+    /// 就「文档焦点离开，收起」再立刻再授权，就是这条被平板豁免点出来的。
+    /// 必须同时有一次尚未判成输入的点击，且 UIA 也不是输入框，才是真离开。
+    /// </summary>
+    public static bool ShouldDismissForLostDocument(
+        bool documentFocused,
+        bool uiaLooksLikeTextInput,
+        bool searchSession,
+        bool hasUnresolvedLeaveClick) =>
+        !documentFocused
+        && !uiaLooksLikeTextInput
+        && !searchSession
+        && hasUnresolvedLeaveClick;
+
+    /// <summary>
+    /// 同一拍里刚因失焦撤了授权，不能马上靠「焦点还像输入」再弹回来。
+    /// </summary>
+    public static bool ShouldReauthorizeAfterRevoke(bool revokedThisSync) =>
+        !revokedThisSync;
+}
+
+/// <summary>
+/// 布局变化只跟线，不重新做弹出/隐藏。官方 OnLayoutChange 也是这个职责。
+/// </summary>
+internal static class LayoutSyncPolicy
+{
+    public static bool IsLayoutOnly(
+        uint source,
+        bool documentActive = true,
+        bool rangeSelected = false)
+    {
+        // 组词/预编辑会把 TSF 选区打成 sel=1。官方候选窗这时只跟 GetTextExt，
+        // 不重新查 UIA。选区手柄让开走 ForegroundTracker，不靠这一位。
+        _ = rangeSelected;
+        return source is 1 or 2 && documentActive;
+    }
+
+    public static bool ShouldUseLayoutFastPath(
+        bool overlayVisible,
+        bool authorized,
+        bool rangeSelected,
+        bool focusAway = false) =>
+        overlayVisible && authorized && !rangeSelected && !focusAway;
+
+    public static bool ShouldProbeUiAutomation(bool layoutOnly) => !layoutOnly;
+
+    public static bool ShouldDecideVisibility(bool layoutOnly) => !layoutOnly;
+
+    public static bool ShouldKeepVisibleWithoutField(
+        bool overlayVisible,
+        bool authorized,
+        bool rejectedWrongBox,
+        bool focusAway = false) =>
+        overlayVisible && authorized && !rejectedWrongBox && !focusAway;
+}
+
+/// <summary>
+/// 官方 ITfContext::GetSelection：空范围是插入点，非空是高亮选区。
+/// 系统 SIP 点进编辑框就会弹，地址栏点一下的全选、Ctrl+A 都要弹。
+/// 只有长按出现选区手柄/选区菜单时才让键盘让开。
+/// </summary>
+internal static class SelectionVisibilityPolicy
+{
+    /// 插入点旁边的单头 Thumb 不是长按选区。必须手柄和选区同时在。
+    /// 右键/长按菜单本身就要让开，不必再等选区。
+    public static bool ShouldHide(
+        bool touchSelectionChrome,
+        bool rangeSelected = true,
+        bool contextMenu = false) =>
+        contextMenu || (touchSelectionChrome && rangeSelected);
+
+    public static bool ShouldShowForCaret(
+        bool touchSelectionChrome,
+        bool rangeSelected = false,
+        bool contextMenu = false) =>
+        !ShouldHide(touchSelectionChrome, rangeSelected, contextMenu);
+}
+
+/// <summary>
+/// 对齐官方触摸键盘（不是鼠标点击模型）。
+/// <list type="bullet">
+/// <item>Win8+ 调用改为跟踪 WM_POINTER，不跟踪鼠标坐标（WPF TipTsfHelper）。</item>
+/// <item>IsUIBusy=False 后同步查询当前焦点控件；RequireTouchInEditControl
+/// 要求手指点在编辑框上，程序把焦点放进框不够。</item>
+/// <item>ShouldShow = 焦点有 UIA Text 模式。Raymond Chen：Edit↔Button 跟着显隐。</item>
+/// <item>位置用 ITfContextView.GetTextExt，不用落点。点一下就是一次 TryShow，
+/// 必须按新光标摆；只有打字引起的同行 GetTextExt 变化不挪窗。</item>
+/// </list>
+/// </summary>
+internal static class SipFocusTrackingPolicy
+{
+    public static bool ShouldIgnoreClickGeometry(
+        bool sipTouchGesture,
+        bool overlayOwnsTouch,
+        bool hasScreenPoint) =>
+        SipLifecyclePolicy.ShouldIgnoreClickGeometry(
+            sipTouchGesture,
+            overlayOwnsTouch,
+            hasScreenPoint);
+
+    public static bool ShouldRepositionForTouchInvoke(
+        bool sipTouchGesture,
+        bool overlayOwnsTouch) =>
+        sipTouchGesture && !overlayOwnsTouch;
+
+    public static bool ShouldHoldHideForFocusQuery(
+        bool authorized,
+        bool gestureRecent,
+        bool focusedText) =>
+        !authorized && gestureRecent && focusedText;
+
+    /// <summary>
+    /// 本次接触是否落在我们盘面上。只能看「正在按」或刚按下的几十毫秒，
+    /// 不能用 800ms 粘滞——否则打完字再点侧栏会被当成还在点键盘，第二次失焦不收。
+    /// </summary>
+    public const int OverlayContactWindowMs = SipLifecyclePolicy.OverlayContactWindowMs;
+
+    public static bool OwnsCurrentContact(
+        bool liveOverOverlay,
+        bool overlayContactFresh) =>
+        SipLifecyclePolicy.OwnsCurrentContact(liveOverOverlay, overlayContactFresh);
+}
+
+/// <summary>
+/// 系统触摸键盘的显隐：焦点落定后同步查询当前焦点控件。
+/// WPF TipTsfHelper 几乎不 Hide，只在每次焦点时 TryShow；系统再判断当前
+/// 焦点有没有 UIA Text 模式，没有就自己关。
+/// 官方 IInputPanelInvocationConfiguration：IsUIBusy 结束后「同步查询
+/// 当前焦点控件」。Raymond Chen：焦点在 Edit 和 Button 之间移动时键盘跟着显隐。
+/// 第三方盘必须自己做这步查询。按下瞬间焦点还在旧 Edit，不能当已经离开。
+/// </summary>
+internal static class SipVisibilityPolicy
+{
+    public const int SettleMilliseconds = 200;
+
+    public static bool ShouldRemainAfterSettle(
+        bool overlayOwnsTouch,
+        bool focusedLooksLikeText,
+        bool focusEnteredText,
+        bool selectionChrome,
+        bool nearbyFieldChrome = false) =>
+        overlayOwnsTouch
+        || focusedLooksLikeText
+        || focusEnteredText
+        || selectionChrome
+        || nearbyFieldChrome;
+
+    public static bool ShouldHideAfterTouchSettle(
+        bool touchSettled,
+        bool overlayOwnsTouch,
+        bool focusedLooksLikeText,
+        bool focusEnteredText,
+        bool selectionChrome,
+        bool nearbyFieldChrome = false,
+        bool searchSession = false) =>
+        !searchSession
+        && touchSettled
+        && !ShouldRemainAfterSettle(
+            overlayOwnsTouch,
+            focusedLooksLikeText,
+            focusEnteredText,
+            selectionChrome,
+            nearbyFieldChrome);
+
+    /// <summary>
+    /// 地址栏刷新键贴在当前框边上，TSF 还在。Cursor 侧栏按钮离编辑框很远。
+    /// </summary>
+    public static bool IsNearbyFieldChrome(
+        NativeRect authorizedBox,
+        NativeRect focusBounds,
+        int slop = 16)
+    {
+        if (authorizedBox.IsEmpty || focusBounds.IsEmpty)
+        {
+            return false;
+        }
+
+        return focusBounds.Left < authorizedBox.Right + slop
+            && focusBounds.Right > authorizedBox.Left - slop
+            && focusBounds.Top < authorizedBox.Bottom + slop
+            && focusBounds.Bottom > authorizedBox.Top - slop;
+    }
+}
+
+/// <summary>
+/// 触摸失焦：按钮焦点经常是地址栏/工具栏误报，文档还在时先确认再收。
+/// 点整页是离开；长按手柄只让开键盘，不撤权。
+/// </summary>
+internal static class TouchFocusLeavePolicy
+{
+    public const int ConfirmMilliseconds = 280;
+
+    public static bool ShouldRevokeNow(
+        bool focusLeft,
+        bool selectionChrome,
+        bool looksLikeText,
+        bool documentFocused,
+        bool touchInvocation)
+    {
+        if (!focusLeft || selectionChrome || looksLikeText)
+        {
+            return false;
+        }
+
+        return !touchInvocation || !documentFocused;
+    }
+
+    public static bool ShouldRevokeAfterConfirm(
+        bool confirmExpired,
+        bool selectionChrome,
+        bool looksLikeText,
+        bool focusEntered,
+        bool pageSurface,
+        bool focusLeft,
+        bool touchDismissArmed) =>
+        confirmExpired
+        && !selectionChrome
+        && !looksLikeText
+        && !focusEntered
+        && (pageSurface || focusLeft || touchDismissArmed);
+
+    public static bool ShouldRevokeForPageTap(
+        bool touchDismissArmed,
+        bool pageSurface,
+        bool selectionChrome,
+        bool looksLikeText,
+        bool focusEntered) =>
+        touchDismissArmed
+        && pageSurface
+        && !selectionChrome
+        && !looksLikeText
+        && !focusEntered;
 }
 
 /// <summary>
@@ -280,8 +583,12 @@ internal static class FieldClickPolicy
         NativeRect fieldBox,
         NativeRect caret,
         int x,
-        int y) =>
-        fromClicked || OpenedBy(fieldBox, caret, x, y);
+        int y,
+        bool hasScreenPoint = true,
+        bool touchInvocation = false) =>
+        (touchInvocation && !hasScreenPoint)
+        || fromClicked
+        || OpenedBy(fieldBox, caret, x, y);
 }
 
 /// <summary>
@@ -323,22 +630,25 @@ internal sealed class KeyboardSession
     private readonly AppSettings _settings;
     private readonly T9OverlayWindow _overlay;
     private readonly ForegroundTracker _foreground;
-    private readonly OfficialTouchKeyboardGuard _officialTouch = new();
     /// <summary>一次点击最多等多久。任务栏搜索交接给 SearchHost 实测约 700ms。</summary>
     private static readonly TimeSpan PointerIntentWindow = TimeSpan.FromSeconds(2);
 
-    /// <summary>重判间隔。只在有待决点击时走，点击落定就停，不是常态轮询。</summary>
-    private static readonly TimeSpan PointerRetryInterval =
-        TimeSpan.FromMilliseconds(70);
+    /// <summary>
+    /// 整页容器上的 Unavailable 不能挂满 2 秒。系统 SIP 等的是随后的焦点进入，
+    /// 不是反复跨进程 UIA。超过这一档还看不清就丢掉，让出 UI 线程。
+    /// </summary>
+    private static readonly TimeSpan UnavailableIntentWindow =
+        TimeSpan.FromMilliseconds(400);
 
     private readonly System.Windows.Threading.DispatcherTimer _firstShowFallback;
-    private readonly System.Windows.Threading.DispatcherTimer _pointerRetry;
     private bool _userDismissed;
     private DateTime _lastActiveContextUtc = DateTime.MinValue;
     private IntPtr _lastActiveContextHost;
     private IntPtr _pendingFirstShowSurface;
     private bool _pendingFirstShowFallbackAuthorized;
     private bool _invocationAuthorized;
+    private bool _searchSession;
+    private bool _revokedThisSync;
     private PointerInvocationOrigin _invocationOrigin;
     private IntPtr _invocationSurface;
     private IntPtr _invocationForeground;
@@ -348,13 +658,23 @@ internal sealed class KeyboardSession
     private (int X, int Y)? _placementClick;
 
     /// <summary>
-    /// "已经授权要弹，但还没拿到坐标"的等待截止时间。
+    /// "已经授权要弹，但还没拿到坐标"的等待起点。
     ///
     /// 取不到输入框时 SyncCore 会早退，而同步只由事件驱动：这段时间里恰好没有别的
     /// 事件路过，这一次就再也没人管了，键盘一直不出来。系统搜索框换框后 UIA 要
     /// 100~600ms 才交出真坐标，正好落在这个空档里，所以必须自己驱动重试。
+    ///
+    /// 记的是起点而不是截止时间：SyncCore 每轮都会再调一次 AwaitCaret，
+    /// 若存的是截止时间就会被一路往后推，重试定时器永远停不下来。
     /// </summary>
-    private DateTime _awaitingCaretUntil = DateTime.MinValue;
+    private DateTime _caretWaitStartedUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// 这一轮已经等超时了。超时后必须停住不再续期，否则全量 SyncCore
+    /// （内含多次跨进程 UIA 探测，实测单轮约 30ms）会一直占着 UI 线程。
+    /// 拿到坐标或者用户再点一次才重新开始等。不再用 70ms 轮询驱动。
+    /// </summary>
+    private bool _caretWaitExpired;
 
     /// <summary>等坐标的上限。真坐标实测 100~600ms 内到达，留足余量即可。</summary>
     private static readonly TimeSpan CaretWaitWindow = TimeSpan.FromMilliseconds(1500);
@@ -364,51 +684,41 @@ internal sealed class KeyboardSession
     /// （日志里 Outside 后 24ms 又 Inside）是同一次点击的回声，不能再授权。
     /// </summary>
     private (int X, int Y, DateTime Utc)? _dismissedClick;
+    private bool _pendingHitUnavailable;
+    private PointerInputHit _pendingHit;
+    private bool _pendingHitTested;
+    private PointerInputHit? _notedPointerHit;
+    private bool _pointerHasScreenPoint = true;
+    private DateTime _lastTouchSyncUtc = DateTime.MinValue;
+    private bool _touchDismissArmed;
+    private bool _focusLeavePending;
+    private readonly System.Windows.Threading.DispatcherTimer _focusLeaveConfirm;
     private NativeRect _lastShownCaret;
+    private bool _lastShownCaretIsInsertion = true;
     private NativeRect _authorizedFieldBox;
     private string _authorizedFieldId = string.Empty;
+    private DateTime _lastAuthorizedUtc = DateTime.MinValue;
+    private DateTime _shownUtc = DateTime.MinValue;
     private static readonly TimeSpan DismissEchoWindow = TimeSpan.FromMilliseconds(400);
+    private DispatcherOperation? _sipQueryOp;
+    private bool _settledRetryQueued;
+    private bool _sipHideRetryQueued;
+    private bool _contactDown;
+    private bool _contextMenuArmed;
 
     public KeyboardSession(AppSettings settings, T9OverlayWindow overlay, ForegroundTracker foreground)
     {
         _settings = settings;
         _overlay = overlay;
         _foreground = foreground;
-        _pointerRetry = new System.Windows.Threading.DispatcherTimer
+        _focusLeaveConfirm = new System.Windows.Threading.DispatcherTimer
         {
-            Interval = PointerRetryInterval
+            Interval = TimeSpan.FromMilliseconds(SipVisibilityPolicy.SettleMilliseconds)
         };
-        _pointerRetry.Tick += (_, _) =>
-        {
-            // 超时判定必须在这里，不能只放在 SyncCore 里：SyncCore 有几条早退路径
-            // (租约未就绪、托盘分支、取不到输入框)位于判定点击之前，走那些路径时
-            // 判定和丢弃都跑不到，点击会永远悬着、定时器空转。
-            if (_pendingPointer is { } pending
-                && DateTime.UtcNow - pending.CreatedUtc > PointerIntentWindow)
-            {
-                _pendingPointer = null;
-            }
-
-            if (DateTime.UtcNow > _awaitingCaretUntil)
-            {
-                _awaitingCaretUntil = DateTime.MinValue;
-            }
-
-            if (_pendingPointer is null && _awaitingCaretUntil == DateTime.MinValue)
-            {
-                _pointerRetry.Stop();
-                return;
-            }
-
-            SyncCore();
-            if (_pendingPointer is null && _awaitingCaretUntil == DateTime.MinValue)
-            {
-                _pointerRetry.Stop();
-            }
-        };
+        _focusLeaveConfirm.Tick += (_, _) => ConfirmTouchFocusLeave();
         _firstShowFallback = new System.Windows.Threading.DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(600)
+            Interval = TimeSpan.FromMilliseconds(800)
         };
         _firstShowFallback.Tick += (_, _) =>
         {
@@ -421,14 +731,19 @@ internal sealed class KeyboardSession
             _pendingFirstShowFallbackAuthorized = true;
             SyncCore();
         };
+        OverlayTouch.Contacted += OnOverlayTouch;
         _overlay.UserClosed += () =>
         {
             _userDismissed = true;
             _invocationAuthorized = false;
             _invocationOrigin = PointerInvocationOrigin.Unknown;
+            _foreground.ClearFocusEntered();
             ClearAuthorizedField();
             _repositionRequested = false;
+            CancelSipFocusQuery();
             ResetPendingFirstShow();
+            SipLifecycle.Shared.NoteLeave();
+            SipLifecycle.Shared.SetPhase(SipPhase.Hidden);
             _overlay.HideOverlay();
         };
         _overlay.PinChanged += OnPinChanged;
@@ -443,8 +758,62 @@ internal sealed class KeyboardSession
         }
     }
 
+    /// <summary>
+    /// 官方 WM_POINTER：每一次框外手指都要在 Input 优先级再查一次当前焦点。
+    /// 只有手指正按在我们盘面上才忽略。已经弹出不能当成「这下不算」——
+    /// 否则第二次点框不弹、点按钮也不收。
+    /// </summary>
+    public void NoteTouchModality()
+    {
+        if (OverlayLive() || SipLifecycle.Shared.OwnsOverlayContact(false))
+        {
+            SipLifecycle.Shared.NoteOverlayContact();
+            _touchDismissArmed = false;
+            _pointerHasScreenPoint = false;
+            _userDismissed = false;
+            CancelSipFocusQuery();
+            return;
+        }
+
+        var alreadyRecent = SipLifecycle.Shared.HasRecentTouch();
+        SipLifecycle.Shared.NoteExternalTouch();
+        _pointerHasScreenPoint = false;
+        _placementClick = null;
+        _userDismissed = false;
+        if (!KeyboardShown())
+        {
+            SuppressOfficialSipOnce();
+        }
+
+        if (PointerContactPolicy.IsHoldBurst(_contactDown))
+        {
+            return;
+        }
+
+        BeginContact();
+        if (!alreadyRecent)
+        {
+            Log.Info("触摸模态，按焦点弹出，不用鼠标坐标");
+        }
+
+        _lastTouchSyncUtc = DateTime.UtcNow;
+        ResetCaretWait();
+        ClearPendingPointer();
+        if (PointerContactPolicy.ShouldShowOnContactStart)
+        {
+            QueueSipFocusQuery();
+        }
+    }
+
     public void NotePointerInput(int x, int y, PointerInvocationOrigin origin)
     {
+        if (origin == PointerInvocationOrigin.Unknown
+            && TouchDevicePolicy.CurrentPreferTouchHitSlop())
+        {
+            NoteTouchModality();
+            return;
+        }
+
         // 点到当前授权框外面就清掉上一个点中的框，否则 TryGet 还会交出
         // 上一个框的坐标，键盘停在旧位置。点在框里则保留，供这一拍定位。
         if (!InputInvocationProbe.Contains(_authorizedFieldBox, x, y, FieldClickPolicy.EdgeTolerance))
@@ -452,48 +821,243 @@ internal sealed class KeyboardSession
             InputInvocationProbe.ClearClickedField();
         }
 
-        InputInvocationProbe.HitTestPointerTarget(x, y, _authorizedFieldBox);
+        _pointerHasScreenPoint = true;
+        _notedPointerHit = InputInvocationProbe.HitTestPointerTarget(
+            x,
+            y,
+            _authorizedFieldBox);
 
+        // 新的一下点击是新一轮意图：上一轮等超时留下的停等标记必须清掉，
+        // 否则坐标一直等不到之后，后面每一次点击都不再重试，就变成点了不弹。
+        ResetCaretWait();
         _pendingPointer = (x, y, origin, DateTime.UtcNow);
+        _pendingHit = PointerInputHit.Unavailable;
+        _pendingHitUnavailable = false;
+        _pendingHitTested = false;
         _placementClick = (x, y);
-        SyncCore();
-        DrivePendingPointer();
+        ManualTap.Note();
+        BeginContact();
+        if ((KeyboardShown() || _invocationAuthorized)
+            && PointerContactPolicy.ShouldRepositionOnContactStart)
+        {
+            _repositionRequested = true;
+        }
+
+        if (PointerContactPolicy.ShouldShowOnContactStart)
+        {
+            SyncCore();
+            QueueOneSettledRetry();
+        }
     }
 
-    /// <summary>
-    /// 待决点击必须自己驱动重判。
-    ///
-    /// 点任务栏搜索时第一下落在的是 explorer 的搜索按钮，真正的文本框要等
-    /// SearchHost 接管后才存在(实测约 700ms)，所以首次判定拿到 Outside 是正常的，
-    /// 判定逻辑本来也设计成"还没准备好就继续等"。但同步只由事件触发：这段时间里
-    /// 恰好没有别的事件路过，这一下就再也没人看它，连超时兜底都没机会跑，
-    /// 用户只能再点一次。成功与否取决于有没有事件凑巧经过，这就是那个随机性的来源。
-    /// </summary>
-    private void DrivePendingPointer()
+    public void NotePointerUp()
     {
-        if (_pendingPointer is null)
+        if (!_contactDown && _pendingPointer is null)
         {
-            _pointerRetry.Stop();
             return;
         }
 
-        if (!_pointerRetry.IsEnabled)
+        _contactDown = false;
+        if (!PointerContactPolicy.ShouldCompleteTap(
+                _contextMenuArmed || _foreground.FocusIsContextMenu))
         {
-            _pointerRetry.Start();
+            return;
+        }
+
+        if (OverlayLive() || SipLifecycle.Shared.OwnsOverlayContact(false))
+        {
+            return;
+        }
+
+        if (_pendingPointer is not null)
+        {
+            SyncCore();
+            QueueOneSettledRetry();
+            return;
+        }
+
+        QueueSipFocusQuery();
+    }
+
+    public void NoteContextMenu()
+    {
+        if (!PointerContactPolicy.ShouldYieldToContextMenu(
+                true,
+                OverlayLive() || SipLifecycle.Shared.OwnsOverlayContact(false),
+                InputInvocationProbe.FocusedLooksLikeTextInput()))
+        {
+            return;
+        }
+
+        _contextMenuArmed = true;
+        CancelSipFocusQuery();
+        ClearPendingPointer();
+        YieldForContextMenu();
+    }
+
+    private void BeginContact()
+    {
+        _contactDown = true;
+        _contextMenuArmed = false;
+    }
+
+    /// <summary>
+    /// 待决点击最多再走一次 Input 优先级查询。坐标未到就等 TSF / UIA 焦点事件，
+    /// 不再用 70ms 全量 UIA 循环。
+    /// </summary>
+    private void QueueOneSettledRetry()
+    {
+        if (_settledRetryQueued)
+        {
+            return;
+        }
+
+        _settledRetryQueued = true;
+        _overlay.Dispatcher.BeginInvoke(
+            DispatcherPriority.Input,
+            new Action(() =>
+            {
+                _settledRetryQueued = false;
+                ExpirePendingPointerIfNeeded();
+                ExpireCaretWaitIfNeeded();
+                if (_pendingPointer is null && _caretWaitStartedUtc == DateTime.MinValue)
+                {
+                    return;
+                }
+
+                SyncCore();
+            }));
+    }
+
+    private void ExpirePendingPointerIfNeeded()
+    {
+        if (_pendingPointer is not { } pending)
+        {
+            return;
+        }
+
+        var age = DateTime.UtcNow - pending.CreatedUtc;
+        var dropUnavailable =
+            _pendingHitUnavailable
+            && pending.Origin == PointerInvocationOrigin.Unknown
+            && age > UnavailableIntentWindow;
+        if (age > PointerIntentWindow || dropUnavailable)
+        {
+            ClearPendingPointer();
         }
     }
 
-    public void Sync(bool imeDocument = false) => SyncCore();
+    private void ExpireCaretWaitIfNeeded()
+    {
+        if (_caretWaitStartedUtc != DateTime.MinValue
+            && DateTime.UtcNow - _caretWaitStartedUtc > CaretWaitWindow)
+        {
+            _caretWaitStartedUtc = DateTime.MinValue;
+            _caretWaitExpired = true;
+        }
+    }
 
-    public void Shutdown() => _officialTouch.Dispose();
+    public void NoteFocusSettled()
+    {
+        ExpirePendingPointerIfNeeded();
+        ExpireCaretWaitIfNeeded();
+        if (OverlayLive() || InputInvocationProbe.FocusedIsOwnPane())
+        {
+            SipLifecycle.Shared.NoteOverlayContact();
+            return;
+        }
 
-    private static bool T9Live() =>
-        OfficialTouchKeyboardPolicy.IsT9Live(ImeHost.Shared.HasOfficialT9Profile());
+        var looksLikeText = InputInvocationProbe.FocusedLooksLikeTextInput();
+        var hardLeave = InputInvocationProbe.FocusedIsHardLeave();
+        var pageSurface = _foreground.FocusOnPageSurface;
+        var selectionChrome = _foreground.FocusLeftIsSelectionChrome;
+        if (PointerContactPolicy.ShouldYieldToContextMenu(
+                _foreground.FocusIsContextMenu,
+                OverlayLive() || SipLifecycle.Shared.OwnsOverlayContact(false),
+                looksLikeText))
+        {
+            YieldForContextMenu();
+            return;
+        }
+
+        var left = hardLeave || pageSurface || _foreground.FocusLeftTextInput;
+        if (_pendingPointer is not null
+            || (_caretWaitStartedUtc != DateTime.MinValue && !_caretWaitExpired))
+        {
+            SyncCore();
+            return;
+        }
+
+        ApplyVisibilityDecision(
+            looksLikeText && !left,
+            left,
+            selectionChrome,
+            SipLifecycle.Shared.HasRecentExternalGesture(),
+            allowRelayout: true,
+            PointerContactPolicy.ShouldYieldToContextMenu(
+                _foreground.FocusIsContextMenu,
+                OverlayLive() || SipLifecycle.Shared.OwnsOverlayContact(false),
+                looksLikeText && !left));
+    }
+
+    public void Sync(bool imeDocument = false, bool layoutOnly = false)
+    {
+        if (layoutOnly)
+        {
+            SyncLayoutOnly();
+            return;
+        }
+
+        SyncCore();
+    }
+
+    /// <summary>
+    /// 打字和拖动手柄只会触发 TSF 布局/编辑通知。官方候选窗这时只重取
+    /// GetTextExt，不重新判决显示。跨进程 UIA 是延迟的主要来源，这里跳过。
+    /// </summary>
+    private void SyncLayoutOnly()
+    {
+        if (!KeyboardShown() || !_invocationAuthorized)
+        {
+            return;
+        }
+
+        if (!ImeHost.Shared.TryGetNativeInputField(out var field))
+        {
+            return;
+        }
+
+        var fingerOnField = SipLifecycle.Shared.HasRecentExternalGesture()
+            && !OverlayLive()
+            && !SipLifecycle.Shared.OwnsOverlayContact(false);
+        if (fingerOnField
+            && KeyboardPositionSession.ShouldHideWhenTapLeavesAuthorizedField(
+                alreadyVisible: true,
+                hasExternalGesture: true,
+                caretBelongs: KeyboardPositionSession.CaretBelongsToAuthorizedField(
+                    _authorizedFieldBox,
+                    _lastShownCaret,
+                    field.Caret,
+                    field.FieldBox),
+                anotherField: KeyboardPositionSession.LooksLikeAnotherField(
+                    _authorizedFieldBox,
+                    _lastShownCaret,
+                    field.Caret,
+                    field.FieldBox),
+                searchSession: _searchSession))
+        {
+            RevokeForFocusLeave("触摸离开当前输入框，收起键盘");
+            return;
+        }
+
+        // 打字只走 TSF 布局通知。官方候选窗这时不挪窗；组词下划线让
+        // GetTextExt 的 Y 抖几像素，跟线会把整窗带着微移。换行等 SyncCore。
+        _ = field;
+    }
 
     private void SyncCore()
     {
         using var scope = Perf.Begin("session.sync");
-        _officialTouch.Sync(OfficialTouchKeyboardPolicy.ShouldSuppress(true, T9Live()));
         var fg = NativeMethods.GetForegroundWindow();
         var top = NativeMethods.GetAncestor(fg, NativeMethods.GaRoot);
         var hasTaskbarSearch = InputFieldProbe.TryGetFocusedTaskbarSearch(
@@ -502,6 +1066,14 @@ internal sealed class KeyboardSession
             || hasTaskbarSearch;
         var t9ContextActive = KeyboardVisibilityPolicy.IsT9ContextActive(
             ImeHost.Shared.CanCommitForeground());
+        if (!ImeHost.Shared.HasOfficialT9Profile())
+        {
+            _invocationAuthorized = false;
+            _invocationOrigin = PointerInvocationOrigin.Unknown;
+            ResetPendingFirstShow();
+            HideUnlessPinned();
+            return;
+        }
 
         if (top != IntPtr.Zero && _foreground.Ignored.Contains(top))
         {
@@ -535,25 +1107,56 @@ internal sealed class KeyboardSession
             && KeyboardInvocationPolicy.IsSearchInvocation(waiting.Origin);
         var searchSession =
             pendingSearch
+            || ShellProcess.IsActiveSearchSession(top, hasTaskbarSearch)
             || (_invocationAuthorized
                 && KeyboardInvocationPolicy.IsSearchInvocation(_invocationOrigin));
+        _searchSession = searchSession;
+        _revokedThisSync = false;
+        var slate = TouchDevicePolicy.CurrentPreferTouchHitSlop();
+        var focusAway = _foreground.FocusLeftTextInput;
+        var selectionChrome = _foreground.FocusLeftIsSelectionChrome;
+        var looksLikeText = InputInvocationProbe.FocusedLooksLikeTextInput();
+        if (OverlayLive() || InputInvocationProbe.FocusedIsOwnPane())
+        {
+            SipLifecycle.Shared.NoteOverlayContact();
+            looksLikeText = true;
+            focusAway = false;
+        }
+
+        var focusEntered = _foreground.FocusEnteredTextInput;
+        var nearbyChrome = SipVisibilityPolicy.IsNearbyFieldChrome(
+            _authorizedFieldBox,
+            _foreground.LastFocusBounds);
         var holdFocusLeft = KeyboardInvocationPolicy.ShouldHoldFocusLeftForSearch(
             pendingSearch,
-            _overlay.IsVisible || _invocationAuthorized);
-        if (_foreground.FocusLeftTextInput && !holdFocusLeft)
+            KeyboardShown() || _invocationAuthorized)
+            || KeyboardInvocationPolicy.ShouldIgnoreFocusLeft(
+                ImeHost.Shared.HasDocumentFocus,
+                slate,
+                selectionChrome)
+            || (searchSession && !_touchDismissArmed);
+        // 官方 SIP：按下瞬间焦点还在旧输入框。不能在这一拍把「待确认离开」清掉。
+        if (!_touchDismissArmed
+            && (_foreground.FocusEnteredTextInput || looksLikeText))
         {
-            if (_invocationAuthorized)
-            {
-                _invocationAuthorized = false;
-                _invocationOrigin = PointerInvocationOrigin.Unknown;
-                _repositionRequested = false;
-                _awaitingCaretUntil = DateTime.MinValue;
-                _pendingPointer = null;
-                ClearAuthorizedField();
-                InputInvocationProbe.ClearClickedField();
-                Log.Info("焦点离开文本框，收起键盘");
-            }
+            CancelFocusLeaveConfirm();
+        }
 
+        if (TouchFocusLeavePolicy.ShouldRevokeNow(
+                focusAway,
+                selectionChrome,
+                looksLikeText,
+                ImeHost.Shared.HasDocumentFocus,
+                slate)
+            && !holdFocusLeft)
+        {
+            RevokeForFocusLeave("焦点离开文本框，收起键盘");
+            _foreground.ClearFocusLeft();
+        }
+        else if (focusAway && !holdFocusLeft)
+        {
+            _focusLeavePending = true;
+            ArmFocusLeaveConfirm();
             _foreground.ClearFocusLeft();
         }
         else if (holdFocusLeft)
@@ -561,20 +1164,45 @@ internal sealed class KeyboardSession
             _foreground.ClearFocusLeft();
         }
 
+        if (TouchFocusLeavePolicy.ShouldRevokeForPageTap(
+                _touchDismissArmed,
+                _foreground.FocusOnPageSurface,
+                selectionChrome,
+                looksLikeText,
+                focusEntered))
+        {
+            RevokeForFocusLeave("触摸离开页面表面，收起键盘");
+        }
+
+        if (SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+                _touchDismissArmed,
+                OverlayOwnsPointer(),
+                looksLikeText,
+                focusEntered,
+                selectionChrome,
+                nearbyChrome,
+                searchSession)
+            && !ShouldHoldHideDuringFocusHandoff())
+        {
+            RevokeForFocusLeave("焦点已不是可输入控件，收起键盘");
+        }
+
         // Chromium 换框 / SearchHost 交接都会短暂打出上下文无效。
-        // 只有“这一下点的不是输入框，而且 UIA 也不是输入框”才按离开收。
+        // 必须同时有一次尚未判成输入的点击，且 UIA 也不是输入框，才是真离开。
         if (KeyboardInvocationPolicy.ShouldDismissForLostDocument(
                 ImeHost.Shared.HasDocumentFocus,
                 InputInvocationProbe.FocusedLooksLikeTextInput(),
                 searchSession,
-                _pendingPointer is not null)
+                _pendingPointer is not null
+                    && TouchInvocationPolicy.CountsAsLeaveClick(_pendingHit))
             && _invocationAuthorized)
         {
             _invocationAuthorized = false;
+            _revokedThisSync = true;
             _invocationOrigin = PointerInvocationOrigin.Unknown;
             _repositionRequested = false;
-            _awaitingCaretUntil = DateTime.MinValue;
-            _pendingPointer = null;
+            ResetCaretWait();
+            ClearPendingPointer();
             ClearAuthorizedField();
             InputInvocationProbe.ClearClickedField();
             Log.Info("TSF 文档焦点离开，收起键盘");
@@ -586,10 +1214,14 @@ internal sealed class KeyboardSession
             _lastActiveContextHost = top;
         }
         var desktopContextGrace = DesktopContextGracePolicy.ShouldBridge(
-            _overlay.IsVisible,
+            KeyboardShown(),
             top != IntPtr.Zero && top == _lastActiveContextHost,
             ImeHost.Shared.HasProfileLeaseFor(top),
-            DateTime.UtcNow - _lastActiveContextUtc);
+            DateTime.UtcNow - _lastActiveContextUtc)
+            || DesktopContextGracePolicy.ShouldHoldAfterAuthorize(
+                KeyboardShown(),
+                top != IntPtr.Zero && top == _invocationForeground,
+                DateTime.UtcNow - _lastAuthorizedUtc);
 
         if (top != IntPtr.Zero
             && ShellProcess.IsTrayChrome(top)
@@ -635,16 +1267,24 @@ internal sealed class KeyboardSession
             && (hasTaskbarSearch
                 ? ImeHost.Shared.HasSystemProfileLease()
                 : ImeHost.Shared.HasForegroundProfileLease());
-        var visibleT9Lease = t9ContextActive || hasProfileLease || desktopContextGrace;
+        var consoleHost = ConsoleInputSurface.IsWindow(top);
+        var visibleT9Lease = t9ContextActive
+            || hasProfileLease
+            || desktopContextGrace
+            || (consoleHost && ImeHost.Shared.HasOfficialT9Profile());
         if (!visibleT9Lease)
         {
-            if (searchSession)
+            if (KeyboardInvocationPolicy.ShouldAwaitSlateFocus(
+                    searchSession,
+                    TouchDevicePolicy.CurrentPreferTouchHitSlop(),
+                    _foreground.FocusEnteredTextInput))
             {
                 AwaitCaret();
                 return;
             }
 
             ResetPendingFirstShow();
+            Log.Info("T9 上下文未就绪，收起键盘");
             HideUnlessPinned();
             return;
         }
@@ -701,16 +1341,29 @@ internal sealed class KeyboardSession
             hasField ? field : default,
             surfaceChanged,
             foregroundChanged);
+        TryAuthorizeSlateFocus(hasField, top);
 
         // 坐标采纳在离开判定之后。套不住这一下落点的光标不能摆——
         // 日志里先重定位 (1016,931) 再读到 (1244,136)，就是焦点还在聊天框。
         var placementClick = _pendingPointer is { } pending
             ? (pending.X, pending.Y)
             : _placementClick;
+        var touchInvocation = TouchDevicePolicy.CurrentPreferTouchHitSlop();
+        var sipTouch = SipLifecyclePolicy.ShouldIgnoreClickGeometry(
+            SipLifecycle.Shared.HasRecentExternalGesture(),
+            OverlayOwnsPointer(),
+            _pointerHasScreenPoint);
         if (hasField
+            && !sipTouch
             && placementClick is { } click
             && !FieldClickPolicy.Trusts(
-                field.FromClicked, field.FieldBox, field.Caret, click.X, click.Y))
+                field.FromClicked,
+                field.FieldBox,
+                field.Caret,
+                click.X,
+                click.Y,
+                _pointerHasScreenPoint,
+                touchInvocation))
         {
             Log.Info(
                 $"丢弃焦点光标 光标=({field.Caret.Left},{field.Caret.Top}) "
@@ -719,6 +1372,7 @@ internal sealed class KeyboardSession
             field = default;
         }
         else if (hasField
+            && !sipTouch
             && !KeyboardInvocationPolicy.ShouldAdoptIncomingField(
                 _pendingPointer is not null,
                 field.FromClicked,
@@ -745,12 +1399,95 @@ internal sealed class KeyboardSession
             }
         }
 
+        if (hasField
+            && !sipTouch
+            && _invocationAuthorized
+            && (!_authorizedFieldBox.IsEmpty || !_lastShownCaret.IsEmpty)
+            && !KeyboardPositionSession.CaretBelongsToAuthorizedField(
+                _authorizedFieldBox,
+                _lastShownCaret,
+                field.Caret,
+                field.FieldBox)
+            && !KeyboardPositionSession.ShouldReplaceAuthorizedField(
+                _authorizedFieldBox,
+                _lastShownCaret,
+                field.Caret,
+                field.FieldBox,
+                field.FromClicked,
+                hasUiField
+                    && hasNativeField
+                    && InputFieldSelectionPolicy.IsSameFocusedGeometry(uiField, nativeField),
+                hasNativeField && !hasUiField,
+                focusEntered,
+                field.CaretIsTrusted,
+                _authorizedFieldId,
+                field.FieldId))
+        {
+            Log.Info(
+                $"锁在当前框，忽略另一处光标 光标=({field.Caret.Left},{field.Caret.Top})");
+            field = field with
+            {
+                Caret = _lastShownCaret.IsEmpty ? field.Caret : _lastShownCaret,
+                FieldBox = _authorizedFieldBox.IsEmpty ? field.FieldBox : _authorizedFieldBox,
+                FieldId = string.IsNullOrEmpty(_authorizedFieldId) ? field.FieldId : _authorizedFieldId
+            };
+            _repositionRequested = false;
+        }
+
+        if (hasField
+            && KeyboardPositionSession.ShouldHideWhenTapLeavesAuthorizedField(
+                KeyboardShown(),
+                sipTouch
+                    && SipLifecycle.Shared.HasRecentExternalGesture()
+                    && !OverlayLive(),
+                KeyboardPositionSession.CaretBelongsToAuthorizedField(
+                    _authorizedFieldBox,
+                    _lastShownCaret,
+                    field.Caret,
+                    field.FieldBox),
+                KeyboardPositionSession.LooksLikeAnotherField(
+                    _authorizedFieldBox,
+                    _lastShownCaret,
+                    field.Caret,
+                    field.FieldBox),
+                surfaceChanged,
+                searchSession))
+        {
+            RevokeForFocusLeave("触摸离开当前输入框，收起键盘");
+            return;
+        }
+
         if (!hasField)
         {
+            if (SipLifecyclePolicy.ShouldHideWhenFieldMissing(
+                    KeyboardShown() || _invocationAuthorized,
+                    searchSession,
+                    selectionChrome,
+                    _touchDismissArmed,
+                    SipLifecycle.Shared.Gesture,
+                    KeyboardShown()
+                        && SipLifecycle.Shared.HasRecentExternalGesture()
+                        && !OverlayLive()))
+            {
+                RevokeForFocusLeave("焦点已不是可输入控件，收起键盘");
+                return;
+            }
+
             // 已经授权要弹、或还有一次点击悬着，就必须自己驱动重试。否则这一轮
             // 早退之后没有任何事件会再来同步，键盘就一直不出来——"点了不弹"。
+            if (LayoutSyncPolicy.ShouldKeepVisibleWithoutField(
+                    KeyboardShown(),
+                    _invocationAuthorized,
+                    rejectedWrongBox,
+                    focusAway)
+                && !(_touchDismissArmed && !looksLikeText && !selectionChrome && !nearbyChrome))
+            {
+                AwaitCaret();
+                return;
+            }
+
             if ((!_invocationAuthorized || rejectedWrongBox)
-                && _overlay.IsVisible
+                && KeyboardShown()
                 && !searchSession)
             {
                 HideUnlessPinned();
@@ -762,7 +1499,7 @@ internal sealed class KeyboardSession
             }
             return;
         }
-        _awaitingCaretUntil = DateTime.MinValue;
+        ResetCaretWait();
         field = InputFieldSelectionPolicy.NormalizeDesktopSurface(
             systemTextHost,
             field,
@@ -770,13 +1507,53 @@ internal sealed class KeyboardSession
             _foreground.Generation);
         _invocationSurface = field.TopLevel;
 
+        var yieldMenu = PointerContactPolicy.ShouldYieldToContextMenu(
+            _foreground.FocusIsContextMenu || _contextMenuArmed,
+            OverlayLive() || SipLifecycle.Shared.OwnsOverlayContact(false),
+            hasField);
+        if (SelectionVisibilityPolicy.ShouldHide(
+                selectionChrome,
+                ImeHost.Shared.HasRangeSelection || field.HasRangeSelection,
+                yieldMenu))
+        {
+            ResetPendingFirstShow();
+            if (yieldMenu)
+            {
+                YieldForContextMenu();
+            }
+            else
+            {
+                HideUnlessPinned();
+                Log.Info("触摸选区手柄，让开键盘");
+            }
+
+            return;
+        }
+
         if (!KeyboardVisibilityPolicy.ShouldShow(
                 true,
                 _userDismissed,
                 visibleT9Lease,
                 _invocationAuthorized))
         {
+            if (KeyboardShown()
+                && DateTime.UtcNow - _lastAuthorizedUtc <= TimeSpan.FromMilliseconds(500))
+            {
+                Log.Info("刚授权弹出，这一拍可见条件抖动，先不收");
+                return;
+            }
+
+            if (SipFocusTrackingPolicy.ShouldHoldHideForFocusQuery(
+                    _invocationAuthorized,
+                    SipLifecycle.Shared.HasRecentExternalGesture(),
+                    hasField || looksLikeText))
+            {
+                Log.Info("焦点查询已看到输入框，等授权，先不收");
+                return;
+            }
+
             ResetPendingFirstShow();
+            Log.Info("可见条件不成立，收起键盘");
             HideUnlessPinned();
             return;
         }
@@ -798,10 +1575,6 @@ internal sealed class KeyboardSession
 
             if (!_pendingFirstShowFallbackAuthorized)
             {
-                if (_repositionRequested && _overlay.IsVisible)
-                {
-                    HideUnlessPinned();
-                }
                 return;
             }
             _pendingFirstShowFallbackAuthorized = true;
@@ -820,24 +1593,30 @@ internal sealed class KeyboardSession
             SystemBoxInput.ClearCapture();
         }
         _foreground.Remember(field.TopLevel);
-        if (KeyboardPositionSession.ShouldFollowTypingLine(_lastShownCaret, field.Caret))
+        var alreadyVisible = KeyboardShown() && _invocationAuthorized;
+        var lineChanged = KeyboardPositionSession.ShouldFollowTypingLine(
+            _lastShownCaret,
+            field.Caret,
+            _lastShownCaretIsInsertion,
+            field.IsInsertionCaret);
+        var fieldChanged = SipLifecyclePolicy.FieldIdentityChanged(
+            _authorizedFieldId,
+            field.FieldId);
+        var caretTapped = SipLifecycle.Shared.Gesture == SipGesture.OnEdit
+            && SipLifecycle.Shared.HasRecentExternalGesture()
+            && !OverlayLive();
+        if (SipLifecyclePolicy.ShouldRepositionNow(
+                alreadyVisible, fieldChanged, lineChanged, caretTapped))
         {
             _repositionRequested = true;
         }
-        _lastShownCaret = field.Caret;
-        if (field.FromClicked
-            || string.Equals(field.FieldId, _authorizedFieldId, StringComparison.Ordinal))
+        else
         {
-            if (!field.FieldBox.IsEmpty)
-            {
-                _authorizedFieldBox = field.FieldBox;
-            }
-
-            if (!string.IsNullOrEmpty(field.FieldId))
-            {
-                _authorizedFieldId = field.FieldId;
-            }
+            _repositionRequested = false;
         }
+        _lastShownCaret = field.Caret;
+        _lastShownCaretIsInsertion = field.IsInsertionCaret;
+        RememberAuthorizedField(field);
         var repositionRequested = _repositionRequested;
         if (repositionRequested)
         {
@@ -845,12 +1624,42 @@ internal sealed class KeyboardSession
                 $"重定位键盘 表面={ShellProcess.Name(field.TopLevel)} "
                 + $"光标=({field.Caret.Left},{field.Caret.Top})");
         }
+        if (!alreadyVisible)
+        {
+            SuppressOfficialSip(field.TopLevel);
+        }
+
+        if (!repositionRequested && alreadyVisible)
+        {
+            if (KeyboardShown())
+            {
+                _shownUtc = DateTime.UtcNow;
+                SipLifecycle.Shared.SetPhase(SipPhase.Visible);
+                SipLifecycle.Shared.ConsumeTap();
+            }
+
+            _repositionRequested = false;
+            return;
+        }
+
+        var target = KeyboardPlacer.Place(field, boardW, boardH);
+        if (alreadyVisible && lineChanged && !fieldChanged && !caretTapped)
+        {
+            target = KeyboardPositionSession.PinHorizontal(_overlay.PlacedRect, target);
+        }
+
         _overlay.PlaceOn(
-            KeyboardPlacer.Place(field, boardW, boardH),
+            target,
             field.TopLevel,
             field.Owner,
             field.Context,
             repositionRequested);
+        if (KeyboardShown())
+        {
+            _shownUtc = DateTime.UtcNow;
+            SipLifecycle.Shared.SetPhase(SipPhase.Visible);
+            SipLifecycle.Shared.ConsumeTap();
+        }
         _repositionRequested = false;
     }
 
@@ -867,10 +1676,16 @@ internal sealed class KeyboardSession
             return;
         }
 
-        var hit = InputInvocationProbe.HitTestFocusedInput(
-            pointer.X,
-            pointer.Y,
-            _authorizedFieldBox);
+        var skipHitTest = _pendingHitTested && _pendingHitUnavailable;
+        var hit = skipHitTest
+            ? PointerInputHit.Unavailable
+            : InputInvocationProbe.HitTestFocusedInput(
+                pointer.X,
+                pointer.Y,
+                _authorizedFieldBox,
+                _notedPointerHit);
+        _notedPointerHit = null;
+        _pendingHitTested = true;
         // FromPoint 还停在整页容器上时命中是 Unavailable。已经拿到套得住
         // 这一下的框，就按 Inside 授权——否则第一次点经常先被 ShouldRelease 收掉。
         // 套不住的框绝不提升，点空白时 TryGet 交出来的仍是聊天框。
@@ -886,12 +1701,26 @@ internal sealed class KeyboardSession
             pointer.X,
             pointer.Y,
             FieldClickPolicy.EdgeTolerance);
+        var textIntent = TouchInvocationPolicy.IsTextIntent(
+            _foreground.FocusEnteredTextInput,
+            ImeHost.Shared.HasDocumentFocus && hasNativeField,
+            skipHitTest
+                ? false
+                : InputInvocationProbe.FocusedLooksLikeTextInput());
+        hit = TouchInvocationPolicy.Promote(
+            hit,
+            textIntent,
+            _invocationAuthorized,
+            clickInsideAuthorized);
+        _pendingHit = hit;
+        _pendingHitUnavailable = hit == PointerInputHit.Unavailable;
         if (KeyboardInvocationPolicy.ShouldReleaseAuthorizedField(
                 _invocationAuthorized,
                 clickInsideAuthorized,
                 hit))
         {
             _invocationAuthorized = false;
+            _revokedThisSync = true;
             _invocationOrigin = PointerInvocationOrigin.Unknown;
             _repositionRequested = false;
             ClearAuthorizedField();
@@ -899,14 +1728,19 @@ internal sealed class KeyboardSession
             if (KeyboardInvocationPolicy.ShouldConsumeLeaveClick(hit))
             {
                 _dismissedClick = (pointer.X, pointer.Y, DateTime.UtcNow);
-                _pendingPointer = null;
-                _awaitingCaretUntil = DateTime.MinValue;
+                ClearPendingPointer();
+                ResetCaretWait();
+                _foreground.ClearFocusEntered();
                 InputInvocationProbe.ClearClickedField();
                 return;
             }
         }
 
-        var expired = DateTime.UtcNow - pointer.CreatedUtc > PointerIntentWindow;
+        var age = DateTime.UtcNow - pointer.CreatedUtc;
+        var expired = age > PointerIntentWindow
+            || (hit == PointerInputHit.Unavailable
+                && pointer.Origin == PointerInvocationOrigin.Unknown
+                && age > UnavailableIntentWindow);
         var resolved = KeyboardInvocationPolicy.TryResolvePointer(
             hit,
             systemTextHost,
@@ -915,22 +1749,30 @@ internal sealed class KeyboardSession
             _userDismissed,
             expired,
             out var authorized);
-        Log.Info(
-            $"系统指针解析 origin={pointer.Origin} hit={hit} "
-            + $"host={systemTextHost} resolved={resolved} "
-            + $"authorized={authorized} expired={expired} "
-            + $"surface={ShellProcess.Name(field.TopLevel)} "
-            + $"ui={hasUiField} native={hasNativeField} "
-            + $"surfaceChanged={surfaceChanged} "
-            + $"foregroundChanged={foregroundChanged}");
+        if (resolved || hit != PointerInputHit.Unavailable)
+        {
+            Log.Info(
+                $"系统指针解析 origin={pointer.Origin} hit={hit} "
+                + $"host={systemTextHost} resolved={resolved} "
+                + $"authorized={authorized} expired={expired} "
+                + $"surface={ShellProcess.Name(field.TopLevel)} "
+                + $"ui={hasUiField} native={hasNativeField} "
+                + $"intent={textIntent} "
+                + $"surfaceChanged={surfaceChanged} "
+                + $"foregroundChanged={foregroundChanged}");
+        }
+
         if (!resolved)
         {
             return;
         }
 
-        // 命中了输入，当前坐标却属于另一个框：不消费这次点击，也不授权摆窗。
-        // GetTextExt / OnCaretBoundsChanged 都只接受当前文档的光标。
-        if (authorized && !field.FromClicked && !clickBelongsToField)
+        // 鼠标点中了输入，当前坐标却属于另一个框：不消费这次点击。
+        // 触摸没有可靠屏幕坐标，系统 SIP 直接信当前文档的 GetTextExt。
+        if (authorized
+            && _pointerHasScreenPoint
+            && !field.FromClicked
+            && !clickBelongsToField)
         {
             Log.Info(
                 $"等待点中框的光标 落点=({pointer.X},{pointer.Y}) "
@@ -951,20 +1793,14 @@ internal sealed class KeyboardSession
         _repositionRequested = authorized;
         if (authorized)
         {
+            _contextMenuArmed = false;
+            _lastAuthorizedUtc = DateTime.UtcNow;
             _foreground.ClearFocusLeft();
             _userDismissed = false;
             _dismissedClick = null;
-            if (field.FromClicked || clickBelongsToField)
+            if (field.FromClicked || clickBelongsToField || !_pointerHasScreenPoint)
             {
-                if (!string.IsNullOrEmpty(field.FieldId))
-                {
-                    _authorizedFieldId = field.FieldId;
-                }
-
-                if (!field.FieldBox.IsEmpty)
-                {
-                    _authorizedFieldBox = field.FieldBox;
-                }
+                RememberAuthorizedField(field);
             }
         }
         else
@@ -974,7 +1810,122 @@ internal sealed class KeyboardSession
             InputInvocationProbe.ClearClickedField();
         }
 
+        _foreground.ClearFocusEntered();
+        ClearPendingPointer();
+    }
+
+    private void ClearPendingPointer()
+    {
         _pendingPointer = null;
+        _pendingHitUnavailable = false;
+        _pendingHit = default;
+        _pendingHitTested = false;
+        _notedPointerHit = null;
+    }
+
+    private void TryAuthorizeSlateFocus(bool hasField, IntPtr top)
+    {
+        if (_invocationAuthorized
+            || !KeyboardInvocationPolicy.ShouldReauthorizeAfterRevoke(_revokedThisSync))
+        {
+            return;
+        }
+
+        var slate = TouchDevicePolicy.CurrentPreferTouchHitSlop();
+        var looksLikeText = InputInvocationProbe.FocusedLooksLikeTextInput();
+        var editTap = EditTouch.AllowsShow(looksLikeText || _foreground.FocusEnteredTextInput);
+        if (!editTap)
+        {
+            return;
+        }
+
+        var hasInput = hasField || looksLikeText;
+        var textIntent = TouchInvocationPolicy.ShouldShowForTouchFocus(
+            slate,
+            ImeHost.Shared.HasDocumentFocus,
+            _foreground.FocusEnteredTextInput,
+            looksLikeText,
+            editTap);
+        if (!KeyboardInvocationPolicy.ShouldAuthorizeSlateOcclusion(
+                slate,
+                hasInput,
+                _foreground.FocusEnteredTextInput,
+                _pendingPointer is { } pending
+                    && OfficialSipHit.IsKeyboardSurface(pending.X, pending.Y),
+                _foreground.FocusOnPageSurface,
+                editTap)
+            && !KeyboardInvocationPolicy.ShouldAuthorizeSlateFocus(slate, textIntent))
+        {
+            return;
+        }
+
+        _invocationAuthorized = true;
+        _invocationOrigin = KeyboardInvocationPolicy.OriginForSearchSurface(
+            ShellProcess.Name(top),
+            ShellProcess.IsTrayChrome(top),
+            ShellProcess.HasVisibleSearchFlyout());
+        _contextMenuArmed = false;
+        _userDismissed = false;
+        _dismissedClick = null;
+        _placementClick = null;
+        _lastAuthorizedUtc = DateTime.UtcNow;
+        ClearPendingPointer();
+        _foreground.ClearFocusLeft();
+        _foreground.ClearFocusEntered();
+        _repositionRequested = true;
+        SipLifecycle.Shared.SetPhase(SipPhase.Visible);
+        SuppressOfficialSipOnce();
+        Log.Info("平板触摸点进输入框，授权弹出");
+    }
+
+    private void SuppressOfficialSipOnce()
+    {
+        if (!SipSuppressionPolicy.ShouldSuppressOfficialSip(ImeHost.Shared.HasOfficialT9Profile()))
+        {
+            return;
+        }
+
+        SuppressOfficialSip(NativeMethods.GetForegroundWindow());
+        if (_sipHideRetryQueued)
+        {
+            return;
+        }
+
+        _sipHideRetryQueued = true;
+        _overlay.Dispatcher.BeginInvoke(
+            DispatcherPriority.Input,
+            new Action(() =>
+            {
+                _sipHideRetryQueued = false;
+                SuppressOfficialSip(NativeMethods.GetForegroundWindow());
+            }));
+    }
+
+    private static void SuppressOfficialSip(IntPtr hwnd)
+    {
+        if (!SipSuppressionPolicy.ShouldSuppressOfficialSip(ImeHost.Shared.HasOfficialT9Profile()))
+        {
+            return;
+        }
+
+        InputPaneController.TryHideWinRt(hwnd);
+        var tray = NativeMethods.FindWindow("Shell_TrayWnd", null);
+        if (tray != IntPtr.Zero && tray != hwnd)
+        {
+            InputPaneController.TryHideWinRt(tray);
+        }
+
+        var secondary = NativeMethods.FindWindow("Shell_SecondaryTrayWnd", null);
+        if (secondary != IntPtr.Zero && secondary != hwnd)
+        {
+            InputPaneController.TryHideWinRt(secondary);
+        }
+
+        if (InputPaneInterop.TryGetLocation(out _))
+        {
+            InputPaneController.TryHideWinRt(hwnd);
+            Log.Info("T9 已接管，收起系统触摸键盘");
+        }
     }
 
     private bool IsDismissEcho(int x, int y)
@@ -993,6 +1944,29 @@ internal sealed class KeyboardSession
         return Math.Abs(x - dismissed.X) <= 8 && Math.Abs(y - dismissed.Y) <= 8;
     }
 
+    private void RememberAuthorizedField(InputField field)
+    {
+        if (!field.FieldBox.IsEmpty && field.FieldBox.Bottom - field.FieldBox.Top <= 160)
+        {
+            _authorizedFieldBox = field.FieldBox;
+        }
+        else if (!field.Caret.IsEmpty)
+        {
+            _authorizedFieldBox = new NativeRect
+            {
+                Left = field.Caret.Left - 16,
+                Top = field.Caret.Top - 8,
+                Right = field.Caret.Left + 280,
+                Bottom = field.Caret.Bottom + 8
+            };
+        }
+
+        if (!string.IsNullOrEmpty(field.FieldId))
+        {
+            _authorizedFieldId = field.FieldId;
+        }
+    }
+
     private void ClearAuthorizedField()
     {
         _authorizedFieldBox = default;
@@ -1001,15 +1975,24 @@ internal sealed class KeyboardSession
 
     private void AwaitCaret()
     {
-        if (_awaitingCaretUntil == DateTime.MinValue)
+        if (_caretWaitExpired)
         {
-            _awaitingCaretUntil = DateTime.UtcNow + CaretWaitWindow;
+            return;
         }
 
-        if (!_pointerRetry.IsEnabled)
+        if (_caretWaitStartedUtc == DateTime.MinValue)
         {
-            _pointerRetry.Start();
+            _caretWaitStartedUtc = DateTime.UtcNow;
         }
+
+        QueueOneSettledRetry();
+    }
+
+    /// <summary>坐标已到手或用户重新点过，等待重新开始计时。</summary>
+    private void ResetCaretWait()
+    {
+        _caretWaitStartedUtc = DateTime.MinValue;
+        _caretWaitExpired = false;
     }
 
     private void ResetPendingFirstShow()
@@ -1019,6 +2002,10 @@ internal sealed class KeyboardSession
         _pendingFirstShowFallbackAuthorized = false;
     }
 
+    private bool ShouldHoldHideDuringFocusHandoff() =>
+        _pendingFirstShowSurface != IntPtr.Zero
+        || DateTime.UtcNow - _lastAuthorizedUtc <= TimeSpan.FromMilliseconds(500);
+
     private void HideUnlessPinned()
     {
         if (!KeyboardPinPolicy.ShouldAutoHide(_overlay.IsPinned))
@@ -1026,7 +2013,237 @@ internal sealed class KeyboardSession
             return;
         }
 
+        SipLifecycle.Shared.SetPhase(SipPhase.Hidden);
         _overlay.HideOverlay();
+    }
+
+    private void RevokeForFocusLeave(string reason)
+    {
+        CancelFocusLeaveConfirm();
+        _touchDismissArmed = false;
+        _focusLeavePending = false;
+        SipLifecycle.Shared.NoteLeave();
+        _foreground.ClearFocusLeft();
+        if (_invocationAuthorized)
+        {
+            _invocationAuthorized = false;
+            _revokedThisSync = true;
+            _invocationOrigin = PointerInvocationOrigin.Unknown;
+            _repositionRequested = false;
+            ResetCaretWait();
+            ClearPendingPointer();
+            ClearAuthorizedField();
+            InputInvocationProbe.ClearClickedField();
+            EditTouch.Note(onText: false, onLeave: true);
+            Log.Info(reason);
+        }
+
+        HideUnlessPinned();
+    }
+
+    private void ArmFocusLeaveConfirm()
+    {
+        if (!_focusLeaveConfirm.IsEnabled)
+        {
+            _focusLeaveConfirm.Start();
+        }
+    }
+
+    private void CancelFocusLeaveConfirm()
+    {
+        _focusLeaveConfirm.Stop();
+        _focusLeavePending = false;
+        _touchDismissArmed = false;
+    }
+
+    private void OnOverlayTouch()
+    {
+        _touchDismissArmed = false;
+        _focusLeavePending = false;
+        _focusLeaveConfirm.Stop();
+        CancelSipFocusQuery();
+    }
+
+    private bool KeyboardShown() =>
+        KeyboardSurfacePolicy.IsShown(_overlay.IsVisible, _overlay.IsHosting);
+
+    private bool OverlayLive() =>
+        _overlay.AreAnyTouchesOver
+        || _overlay.IsStylusOver
+        || ImeHost.Shared.HostPointerLive;
+
+    private bool OverlayOwnsPointer() =>
+        SipLifecycle.Shared.OwnsOverlayContact(OverlayLive());
+
+    private void ApplyVisibilityDecision(
+        bool focusIsText,
+        bool hardLeave,
+        bool selectionChrome,
+        bool hasExternalGesture,
+        bool allowRelayout,
+        bool contextMenu = false)
+    {
+        var action = SipLifecyclePolicy.Decide(
+            KeyboardShown(),
+            OverlayLive() || InputInvocationProbe.FocusedIsOwnPane(),
+            SipLifecycle.Shared.OwnsOverlayContact(false),
+            focusIsText,
+            hardLeave,
+            selectionChrome,
+            hasExternalGesture,
+            contextMenu,
+            KeyboardInvocationPolicy.IsSearchInvocation(_invocationOrigin)
+                || (_pendingPointer is { } waiting
+                    && KeyboardInvocationPolicy.IsSearchInvocation(waiting.Origin)));
+        if (action == SipVisibilityAction.Relayout && !allowRelayout)
+        {
+            action = SipVisibilityAction.Stay;
+        }
+
+        switch (action)
+        {
+            case SipVisibilityAction.Stay:
+                return;
+            case SipVisibilityAction.Pending:
+                if (_invocationAuthorized && !KeyboardShown())
+                {
+                    _invocationAuthorized = false;
+                    _revokedThisSync = true;
+                    ClearAuthorizedField();
+                }
+
+                SipLifecycle.Shared.SetPhase(SipPhase.Pending);
+                return;
+            case SipVisibilityAction.Hide:
+                if (ShouldHoldHideDuringFocusHandoff())
+                {
+                    Log.Info("刚授权弹出，焦点查询还在交接，先不收");
+                    return;
+                }
+
+                RevokeForFocusLeave("焦点已不是可输入控件，收起键盘");
+                return;
+            case SipVisibilityAction.Show:
+            case SipVisibilityAction.Relayout:
+                SipLifecycle.Shared.NoteSettled(SipGesture.OnEdit);
+                SyncCore();
+                return;
+        }
+    }
+
+    private void QueueSipFocusQuery()
+    {
+        if (_sipQueryOp is { Status: DispatcherOperationStatus.Pending })
+        {
+            _sipQueryOp.Abort();
+        }
+
+        _sipQueryOp = _overlay.Dispatcher.BeginInvoke(
+            DispatcherPriority.Input,
+            new Action(ConfirmSipFocusQuery));
+    }
+
+    private void CancelSipFocusQuery()
+    {
+        if (_sipQueryOp is { Status: DispatcherOperationStatus.Pending })
+        {
+            _sipQueryOp.Abort();
+        }
+
+        _sipQueryOp = null;
+    }
+
+    /// <summary>
+    /// 官方 TipTsfHelper：推迟到 Input 优先级，焦点可能已经变了再查。
+    /// 点在盘面上（正在按、刚按下、或焦点已落到我们自己的按钮）不收。
+    /// </summary>
+    private void ConfirmSipFocusQuery()
+    {
+        _sipQueryOp = null;
+        if (SipLifecyclePolicy.ShouldStayForKeyboardFocus(
+                OverlayLive(),
+                SipLifecycle.Shared.OwnsOverlayContact(false),
+                InputInvocationProbe.FocusedIsOwnPane()))
+        {
+            SipLifecycle.Shared.NoteOverlayContact();
+            return;
+        }
+
+        var looksLikeText = InputInvocationProbe.FocusedLooksLikeTextInput();
+        var hardLeave = InputInvocationProbe.FocusedIsHardLeave();
+        var left = hardLeave
+            || _foreground.FocusOnPageSurface
+            || _foreground.FocusLeftTextInput;
+        var searchHold =
+            _pendingPointer is { } waiting
+                && KeyboardInvocationPolicy.IsSearchInvocation(waiting.Origin)
+            || KeyboardInvocationPolicy.IsSearchInvocation(_invocationOrigin);
+        if (PointerContactPolicy.ShouldYieldToContextMenu(
+                _foreground.FocusIsContextMenu || _contextMenuArmed,
+                OverlayLive() || SipLifecycle.Shared.OwnsOverlayContact(false),
+                looksLikeText))
+        {
+            YieldForContextMenu();
+            return;
+        }
+
+        ApplyVisibilityDecision(
+            looksLikeText && !left,
+            left,
+            selectionChrome: false,
+            hasExternalGesture: SipLifecycle.Shared.HasRecentExternalGesture()
+                && (!searchHold || looksLikeText),
+            allowRelayout: false,
+            contextMenu: false);
+    }
+
+    private void YieldForContextMenu()
+    {
+        CancelSipFocusQuery();
+        _contextMenuArmed = true;
+        if (!KeyboardShown() && !_invocationAuthorized)
+        {
+            return;
+        }
+
+        RevokeForFocusLeave("右键菜单，让开键盘");
+        if (KeyboardShown())
+        {
+            SipLifecycle.Shared.SetPhase(SipPhase.Hidden);
+            _overlay.HideOverlay();
+        }
+    }
+
+    private void ConfirmTouchFocusLeave()
+    {
+        _focusLeaveConfirm.Stop();
+        if (OverlayLive())
+        {
+            _focusLeavePending = false;
+            _touchDismissArmed = false;
+            return;
+        }
+
+        var looksLikeText = InputInvocationProbe.FocusedLooksLikeTextInput();
+        if (SipVisibilityPolicy.ShouldHideAfterTouchSettle(
+                touchSettled: _touchDismissArmed || _focusLeavePending,
+                overlayOwnsTouch: false,
+                looksLikeText,
+                _foreground.FocusEnteredTextInput,
+                _foreground.FocusLeftIsSelectionChrome,
+                SipVisibilityPolicy.IsNearbyFieldChrome(
+                    _authorizedFieldBox,
+                    _foreground.LastFocusBounds),
+                KeyboardInvocationPolicy.IsSearchInvocation(_invocationOrigin))
+            && !ShouldHoldHideDuringFocusHandoff())
+        {
+            RevokeForFocusLeave("焦点已不是可输入控件，收起键盘");
+            return;
+        }
+
+        // 官方模型：这一拍焦点还是输入框，不能当成已经离开。
+        // 武装留下，等下一次焦点变化再同步查询。
+        _focusLeavePending = false;
     }
 
     private void OnPinChanged(bool pinned)
@@ -1047,13 +2264,8 @@ internal sealed class KeyboardSession
 
     private void OnBoardLayoutChanged()
     {
-        if (!KeyboardAnchorPolicy.ShouldFollowInput(_overlay.IsPinned, _invocationAuthorized))
-        {
-            return;
-        }
-
-        _repositionRequested = true;
-        SyncCore();
+        // 切盘只改窗口尺寸。禁止再走 UIA/SyncCore，否则会拿到整页 Document
+        // 顶上的假光标，键盘飞到屏幕顶端挡住输入。
     }
 
 }

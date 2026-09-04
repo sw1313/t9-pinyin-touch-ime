@@ -1,7 +1,7 @@
 # T9 拼音触屏输入法
 
 独立的 Windows 触屏拼音输入法：九键、26 键、英文、全键、数字和符号盘。  
-语言栏里是一层薄的 TSF DLL，词库和键盘界面跑在本进程。点到输入框才弹出，失焦收起，不叠加微软触摸键盘。
+语言栏里是一层薄的 TSF DLL，词库和键盘界面跑在本进程。手指点进带文字模式的输入框才弹出，焦点离开文本就收起。语言栏是 T9 时，宿主进程里会取消系统输入面板的显示请求，官方触摸键盘不会先闪一下再被藏掉。不改「显示触摸键盘」注册表。
 
 **许可：** [GNU GPL v3](LICENSE)  
 **仓库名：** `t9-pinyin-touch-ime`  
@@ -15,7 +15,8 @@
 2. 双击安装程序，在 UAC 点「是」。没有 .NET 8 时会自动下载对应架构的桌面运行时。
 3. 程序装到 `%ProgramFiles%\T9Pane`。x64 系统注册 x64 + x86 IME。ARM64 系统用 **Arm64X** 转发：原生应用走 ARM64 IME，x64 模拟应用走 x64 IME，另注册 x86 IME。32 位系统只注册 32 位 DLL。覆盖安装会先清掉旧输入法注册和旧 DLL，**保留** `%APPDATA%\T9Pane` 里的设置、用户词库和键盘背景。
 4. 按 **Win+空格** 切到 **T9 九键**。
-5. **用手指或鼠标点一下文本框**，键盘才会出现。只靠系统自动聚焦不会弹。
+5. **用手指或鼠标点一下文本框**，键盘才会出现。只靠窗口自己聚焦、或程序 `SetFocus` 不会弹。
+6. 覆盖安装后，已打开过 T9 的进程（至少 **SearchHost**、资源管理器）需要重启，新的 `T9Ime.dll` 才会进到搜索框里。
 
 卸载：在「设置 → 应用」里卸载「T9 拼音触屏输入法」，或再次运行 Setup 时使用 `T9Setup.exe /uninstall`。
 
@@ -27,14 +28,23 @@ pwsh -File tools\Pack-Release.ps1
 
 生成文件在 `dist\T9-Pinyin-Touch-IME-*-Setup.exe`。这是原生 Win32 安装程序，用户不用跑 PowerShell 或 bat。
 
+## 当前版本 0.1.58
+
+对照官方触摸键盘（WPF TipTsfHelper / `RequireTouchInEditControl` / `ITfContextView.GetTextExt` / CFS_EXCLUDE）：
+
+- 弹出：手指点进带 UIA Text 的框。窗口自带焦点不够。
+- 收起：焦点落定后不再是文本（Edit↔Button）。Chromium 短暂 `SetFocus(null)` 或探测失败不会把刚弹出来的盘收掉。
+- 位置：只用插入点（GetTextExt / TextPattern），不用元素外框顶边；键盘不得盖住正在打的框。
+- 搜索：开始菜单 / 任务栏搜索走 SearchHost 里的系统浮层位图键盘（HostRender）。组词只上拼音，联想走 `ITfFnSearchCandidateProvider`，不再把汉字和分隔符塞进普通输入框。
+
 ## 功能
 
 - 九键拼音、26 键拼音、英文、全键、数字、符号
 - 候选条与联想；英文 / 全键也可展开
 - 托盘菜单：开机启动、透明度、按盘面尺寸换背景图、重载词库
 - 必须点到文本区才弹出；切走输入框会收起
-- 切到「T9 九键」时把系统「显示触摸键盘」改成从不；切回其他输入法、退出或卸载后再恢复原设置
-- 开始菜单搜索和任务栏搜索共用 SearchHost 窗口，按输入框而不是按窗口句柄区分
+- 语言栏是 T9 时在宿主进程取消官方输入面板，切走 T9 立刻停拦
+- 开始菜单搜索和任务栏搜索走 SearchHost 浮层键盘，按输入框而不是按窗口句柄区分
 
 ## 从源码编译
 
@@ -103,7 +113,7 @@ pwsh -File src\T9Pane\Tools\Test-UwpIme.ps1 -Scenario All
 | 路径 | 内容 |
 | --- | --- |
 | `src/T9Pane` | WPF 键盘、词库引擎、安装脚本 |
-| `src/T9Ime` | 原生 TSF 输入法 DLL（x64 / x86） |
+| `src/T9Ime` | 原生 TSF 输入法 DLL（x64 / x86 / ARM64 / Arm64X） |
 | `src/T9Setup` | 原生 Win32 安装程序（双击安装 / 卸载） |
 | `src/T9Pane.Tests` | 单元测试 |
 | `src/T9Pane/Data/xiaobai-t9` | 随包开源词库（约 43 MB） |

@@ -9,6 +9,7 @@
 #include <urlmon.h>
 #include <vector>
 #include <winhttp.h>
+#include <wow64apiset.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -466,7 +467,7 @@ namespace
             RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t)));
         };
         set(L"DisplayName", L"T9 拼音触屏输入法");
-        set(L"DisplayVersion", L"0.1.15");
+        set(L"DisplayVersion", L"0.1.58");
         set(L"Publisher", L"sw1313");
         set(L"InstallLocation", DestDir().c_str());
         set(L"DisplayIcon", DestExe().c_str());
@@ -849,6 +850,128 @@ void PatchUiAccessManifest(const wchar_t* exe, const wchar_t* manifestPath)
     }
 }
 
+namespace
+{
+    constexpr wchar_t kSipBlockPath[] = L"Software\\T9Pane\\OfficialSipBlock";
+    constexpr wchar_t kIfeoRoot[] =
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+    constexpr wchar_t kTextInputPolicy[] =
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\TextInput";
+    constexpr wchar_t kTextInputPolicyAlt[] = L"SOFTWARE\\Policies\\Microsoft\\Windows\\TextInput";
+    constexpr REGSAM kNative64 = KEY_READ | KEY_WRITE | KEY_WOW64_64KEY;
+
+    void WriteDword64(HKEY key, const wchar_t* name, DWORD value)
+    {
+        RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    }
+
+    bool ReadDword64(HKEY key, const wchar_t* name, DWORD& value)
+    {
+        DWORD type = 0;
+        DWORD size = sizeof(value);
+        return RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size)
+                == ERROR_SUCCESS
+            && type == REG_DWORD;
+    }
+
+    void RestoreIfeoDebugger(const wchar_t* exeName, HKEY backup, const wchar_t* tag)
+    {
+        const std::wstring path = std::wstring(kIfeoRoot) + L"\\" + exeName;
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, kNative64, &key) != ERROR_SUCCESS)
+        {
+            return;
+        }
+
+        DWORD had = 0;
+        const std::wstring hadName = std::wstring(L"Had") + tag;
+        const std::wstring valueName = std::wstring(L"Old") + tag;
+        if (ReadDword64(backup, hadName.c_str(), had) && had)
+        {
+            wchar_t old[MAX_PATH]{};
+            DWORD type = 0;
+            DWORD size = sizeof(old);
+            if (RegQueryValueExW(backup, valueName.c_str(), nullptr, &type, reinterpret_cast<BYTE*>(old), &size)
+                == ERROR_SUCCESS)
+            {
+                RegSetValueExW(key, L"Debugger", 0, type, reinterpret_cast<const BYTE*>(old), size);
+                RegCloseKey(key);
+                return;
+            }
+        }
+
+        RegDeleteValueW(key, L"Debugger");
+        RegCloseKey(key);
+    }
+
+    void RestoreAllowInputPanel(HKEY backup)
+    {
+        const wchar_t* paths[] = { kTextInputPolicy, kTextInputPolicyAlt };
+        const wchar_t* tags[] = { L"A", L"B" };
+        for (int i = 0; i < 2; ++i)
+        {
+            HKEY key = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, paths[i], 0, kNative64, &key) != ERROR_SUCCESS)
+            {
+                continue;
+            }
+
+            DWORD had = 0;
+            const std::wstring hadName = std::wstring(L"HadAllowInputPanel_") + tags[i];
+            const std::wstring valueName = std::wstring(L"OldAllowInputPanel_") + tags[i];
+            if (ReadDword64(backup, hadName.c_str(), had) && had)
+            {
+                DWORD old = 1;
+                ReadDword64(backup, valueName.c_str(), old);
+                WriteDword64(key, L"AllowInputPanel", old);
+            }
+            else
+            {
+                RegDeleteValueW(key, L"AllowInputPanel");
+            }
+
+            RegCloseKey(key);
+        }
+    }
+
+    void RestoreOfficialSipLaunch()
+    {
+        HKEY backup = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSipBlockPath, 0, kNative64, &backup) != ERROR_SUCCESS)
+        {
+            return;
+        }
+
+        DWORD active = 0;
+        if (!ReadDword64(backup, L"Active", active) || active == 0)
+        {
+            RegCloseKey(backup);
+            RegDeleteTreeW(HKEY_LOCAL_MACHINE, kSipBlockPath);
+            return;
+        }
+
+        RestoreIfeoDebugger(L"TextInputHost.exe", backup, L"TextInputHost");
+        RestoreIfeoDebugger(L"TabTip.exe", backup, L"TabTip");
+        RestoreIfeoDebugger(L"TabTip32.exe", backup, L"TabTip32");
+        RestoreAllowInputPanel(backup);
+        RegCloseKey(backup);
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, kSipBlockPath);
+
+        DWORD_PTR result = 0;
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            400,
+            &result);
+        Log(L"已恢复系统触摸键盘启动拦截");
+    }
+}
+
+void RestoreOfficialTouchKeyboard();
+
 void InstallFromSource(HWND dlg, const std::wstring& source)
 {
     if (!NativeAmd64() && !NativeX86() && !NativeArm64())
@@ -1002,6 +1125,9 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
     const std::wstring uninstallDest = dest + L"\\Uninstall.exe";
     CopyFileW(self, uninstallDest.c_str(), FALSE);
     WriteUninstallKey(uninstallDest);
+    UiStatus(dlg, L"正在清除系统触摸键盘拦截…");
+    RestoreOfficialTouchKeyboard();
+    RestoreOfficialSipLaunch();
     UiStatus(dlg, L"正在启动键盘后端…");
     StartViaExplorer(exe);
     Log(L"安装完成 dest=%s amd64=%d arm64=%d", dest.c_str(), NativeAmd64() ? 1 : 0, NativeArm64() ? 1 : 0);
@@ -1076,6 +1202,10 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
             L"EnableDesktopModeAutoInvoke",
             L"T9Pane.Backup.HadEnableDesktopModeAutoInvoke",
             L"T9Pane.Backup.EnableDesktopModeAutoInvoke");
+        restoreDword(
+            L"TipbandDesiredVisibility",
+            L"T9Pane.Backup.HadTipbandDesiredVisibility",
+            L"T9Pane.Backup.TipbandDesiredVisibility");
 
         HKEY input = nullptr;
         if (RegCreateKeyExW(
@@ -1140,6 +1270,69 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
             RegCloseKey(input);
         }
 
+        HKEY tipPolicy = nullptr;
+        if (RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                L"Software\\Policies\\Microsoft\\TabletTip\\1.7",
+                0,
+                nullptr,
+                0,
+                access,
+                nullptr,
+                &tipPolicy,
+                nullptr) == ERROR_SUCCESS)
+        {
+            auto restorePolicy = [&](const wchar_t* name, const wchar_t* hadName, const wchar_t* backupName)
+            {
+                DWORD had = 0;
+                DWORD hadSize = sizeof(had);
+                if (RegQueryValueExW(key, hadName, nullptr, &type, reinterpret_cast<BYTE*>(&had), &hadSize)
+                    != ERROR_SUCCESS)
+                {
+                    return;
+                }
+
+                if (had)
+                {
+                    DWORD value = 0;
+                    DWORD valueSize = sizeof(value);
+                    if (RegQueryValueExW(
+                            key,
+                            backupName,
+                            nullptr,
+                            &type,
+                            reinterpret_cast<BYTE*>(&value),
+                            &valueSize) == ERROR_SUCCESS)
+                    {
+                        RegSetValueExW(
+                            tipPolicy,
+                            name,
+                            0,
+                            REG_DWORD,
+                            reinterpret_cast<const BYTE*>(&value),
+                            sizeof(value));
+                    }
+
+                    return;
+                }
+
+                RegDeleteValueW(tipPolicy, name);
+            };
+            restorePolicy(
+                L"HideIPTIPTouchTarget",
+                L"T9Pane.Backup.HadHideIPTIPTouchTarget",
+                L"T9Pane.Backup.HideIPTIPTouchTarget");
+            restorePolicy(
+                L"DisableEdgeTarget",
+                L"T9Pane.Backup.HadDisableEdgeTarget",
+                L"T9Pane.Backup.DisableEdgeTarget");
+            restorePolicy(
+                L"HideIPTIPTarget",
+                L"T9Pane.Backup.HadHideIPTIPTarget",
+                L"T9Pane.Backup.HideIPTIPTarget");
+            RegCloseKey(tipPolicy);
+        }
+
         RegDeleteValueW(key, L"T9Pane.Backup.Active");
         RegDeleteValueW(key, L"T9Pane.Backup.HadEnableDesktopModeAutoInvoke");
         RegDeleteValueW(key, L"T9Pane.Backup.EnableDesktopModeAutoInvoke");
@@ -1147,6 +1340,14 @@ void InstallFromSource(HWND dlg, const std::wstring& source)
         RegDeleteValueW(key, L"T9Pane.Backup.TouchKeyboardTapInvoke");
         RegDeleteValueW(key, L"T9Pane.Backup.HadTouchKeyboardInvocationPolicy");
         RegDeleteValueW(key, L"T9Pane.Backup.TouchKeyboardInvocationPolicy");
+        RegDeleteValueW(key, L"T9Pane.Backup.HadTipbandDesiredVisibility");
+        RegDeleteValueW(key, L"T9Pane.Backup.TipbandDesiredVisibility");
+        RegDeleteValueW(key, L"T9Pane.Backup.HadHideIPTIPTouchTarget");
+        RegDeleteValueW(key, L"T9Pane.Backup.HideIPTIPTouchTarget");
+        RegDeleteValueW(key, L"T9Pane.Backup.HadDisableEdgeTarget");
+        RegDeleteValueW(key, L"T9Pane.Backup.DisableEdgeTarget");
+        RegDeleteValueW(key, L"T9Pane.Backup.HadHideIPTIPTarget");
+        RegDeleteValueW(key, L"T9Pane.Backup.HideIPTIPTarget");
         RegCloseKey(key);
         DWORD_PTR result = 0;
         SendMessageTimeoutW(
@@ -1165,6 +1366,7 @@ void UninstallProduct(HWND dlg)
     UiStatus(dlg, L"正在卸载…");
     KillT9Pane();
     RestoreOfficialTouchKeyboard();
+    RestoreOfficialSipLaunch();
     const std::wstring dest = DestDir();
     UnregisterInstalledImes(dest);
     DeleteStaleImeRegistration();
@@ -1180,31 +1382,172 @@ void UninstallProduct(HWND dlg)
     Log(L"卸载完成");
 }
 
-bool HasDesktopRuntime()
+bool FolderHasDesktop8(const std::wstring& candidate)
 {
-    const bool native64 = Native64();
-    std::wstring root = native64
-        ? KnownFolderPath(FOLDERID_ProgramFilesX64)
-        : KnownFolderPath(FOLDERID_ProgramFiles);
-    if (root.empty())
-    {
-        wchar_t fallback[MAX_PATH]{};
-        SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, SHGFP_TYPE_CURRENT, fallback);
-        root = fallback;
-    }
-
-    wchar_t dir[MAX_PATH]{};
-    PathCombineW(dir, root.c_str(), L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
-    const std::wstring pattern = std::wstring(dir) + L"\\8.*";
-    WIN32_FIND_DATAW fd{};
-    const HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
-    if (find == INVALID_HANDLE_VALUE)
+    if (candidate.empty())
     {
         return false;
     }
 
-    FindClose(find);
-    return true;
+    std::wstring dir = candidate;
+    if (dir.size() >= 1 && (dir.back() == L'\\' || dir.back() == L'/'))
+    {
+        dir.pop_back();
+    }
+
+    const std::wstring direct = dir + L"\\shared\\Microsoft.WindowsDesktop.App";
+    const std::wstring nested = dir + L"\\dotnet\\shared\\Microsoft.WindowsDesktop.App";
+    const std::wstring* roots[] = { &direct, &nested };
+    for (const auto* root : roots)
+    {
+        WIN32_FIND_DATAW fd{};
+        const HANDLE find = FindFirstFileW((*root + L"\\*").c_str(), &fd);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            continue;
+        }
+
+        bool found = false;
+        do
+        {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                && fd.cFileName[0] == L'8'
+                && fd.cFileName[1] == L'.')
+            {
+                Log(L"已检测到 .NET 8 桌面运行时 %s\\%s", root->c_str(), fd.cFileName);
+                found = true;
+                break;
+            }
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+        if (found)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool RegistryHasDesktop8()
+{
+    const wchar_t* keys[] = {
+        L"SOFTWARE\\dotnet\\Setup\\InstalledVersions\\WindowsDesktop\\sharedfx\\Microsoft.WindowsDesktop.App",
+        L"SOFTWARE\\WOW6432Node\\dotnet\\Setup\\InstalledVersions\\WindowsDesktop\\sharedfx\\Microsoft.WindowsDesktop.App",
+    };
+    const REGSAM wows[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY, 0 };
+    for (const auto* keyPath : keys)
+    {
+        for (const auto wow : wows)
+        {
+            HKEY key = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, KEY_READ | wow, &key) != ERROR_SUCCESS)
+            {
+                continue;
+            }
+
+            DWORD index = 0;
+            wchar_t name[64]{};
+            DWORD nameLen = ARRAYSIZE(name);
+            while (RegEnumValueW(
+                       key, index++, name, &nameLen, nullptr, nullptr, nullptr, nullptr)
+                   == ERROR_SUCCESS)
+            {
+                if (name[0] == L'8' && name[1] == L'.')
+                {
+                    Log(L"注册表已有 .NET 8 桌面运行时 %s", name);
+                    RegCloseKey(key);
+                    return true;
+                }
+
+                nameLen = ARRAYSIZE(name);
+            }
+
+            index = 0;
+            nameLen = ARRAYSIZE(name);
+            while (RegEnumKeyExW(key, index++, name, &nameLen, nullptr, nullptr, nullptr, nullptr)
+                   == ERROR_SUCCESS)
+            {
+                if (name[0] == L'8' && name[1] == L'.')
+                {
+                    Log(L"注册表已有 .NET 8 桌面运行时 %s", name);
+                    RegCloseKey(key);
+                    return true;
+                }
+
+                nameLen = ARRAYSIZE(name);
+            }
+
+            RegCloseKey(key);
+        }
+    }
+
+    return false;
+}
+
+bool HasDesktopRuntime()
+{
+    PVOID cookie = nullptr;
+    const BOOL disabled = Wow64DisableWow64FsRedirection(&cookie);
+
+    std::vector<std::wstring> roots;
+    auto add = [&](std::wstring path)
+    {
+        if (!path.empty())
+        {
+            roots.push_back(std::move(path));
+        }
+    };
+    add(KnownFolderPath(FOLDERID_ProgramFiles));
+    add(KnownFolderPath(FOLDERID_ProgramFilesX64));
+    add(KnownFolderPath(FOLDERID_ProgramFilesX86));
+
+    wchar_t env[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"ProgramW6432", env, MAX_PATH) > 0)
+    {
+        add(env);
+    }
+    if (GetEnvironmentVariableW(L"ProgramFiles", env, MAX_PATH) > 0)
+    {
+        add(env);
+    }
+    if (GetEnvironmentVariableW(L"DOTNET_ROOT", env, MAX_PATH) > 0)
+    {
+        add(env);
+    }
+    if (GetEnvironmentVariableW(L"DOTNET_ROOT(x64)", env, MAX_PATH) > 0)
+    {
+        add(env);
+    }
+    if (GetEnvironmentVariableW(L"DOTNET_ROOT(arm64)", env, MAX_PATH) > 0)
+    {
+        add(env);
+    }
+
+    wchar_t local[MAX_PATH]{};
+    if (SUCCEEDED(SHGetFolderPathW(
+            nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, local)))
+    {
+        add(std::wstring(local) + L"\\Microsoft\\dotnet");
+        add(std::wstring(local) + L"\\dotnet");
+    }
+
+    bool found = false;
+    for (const auto& root : roots)
+    {
+        if (FolderHasDesktop8(root))
+        {
+            found = true;
+            break;
+        }
+    }
+
+    if (disabled)
+    {
+        Wow64RevertWow64FsRedirection(cookie);
+    }
+
+    return found || RegistryHasDesktop8();
 }
 
 bool FileLooksLikeRuntimeInstaller(const wchar_t* path)
